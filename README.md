@@ -8,9 +8,9 @@ This mod provides a customizable real-time heads-up display (HUD Overlay) that t
 
 ## 📸 Preview
 
-| Horizontal Blocks Mode | Horizontal Bars Mode |
-| :---: | :---: |
-| ![Horizontal Blocks Mode](screenshots/screenshot.png) | ![Horizontal Bars Mode](screenshots/screenshot2.png) |
+| Horizontal Blocks Mode | Horizontal Bars Mode | Compact Vertical Mode |
+| :---: | :---: | :---: |
+| ![Horizontal Blocks Mode](screenshots/screenshot.png) | ![Horizontal Bars Mode](screenshots/screenshot2.png) | ![Compact Vertical Mode](screenshots/Compact_Vertical_mode.png) |
 
 ---
 
