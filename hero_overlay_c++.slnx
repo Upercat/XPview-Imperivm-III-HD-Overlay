@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="src/hero_overlay_c++.vcxproj" Id="63d347ba-6cc1-4437-bf2d-30dd441f7a67" />
+</Solution>

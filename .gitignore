@@ -1,0 +1,39 @@
+# Visual Studio build & temporary files
+.vs/
+Debug/
+Release/
+x64/
+x86/
+*.user
+*.aps
+*.ncb
+*.suo
+*.userosv
+*.sln.docstates
+*.db
+*.opendb
+
+# Build outputs & intermediate files
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pch
+*.res
+*.idb
+*.pdb
+*.ilk
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.rsp
+*.log
+*.cache
+
+# Subdirectory build files
+hero_overlay_c++/Debug/
+hero_overlay_c++/Release/
+hero_overlay_c++/x64/
+hero_overlay_c++/x86/
