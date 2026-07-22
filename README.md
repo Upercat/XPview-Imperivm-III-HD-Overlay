@@ -6,6 +6,14 @@ This mod provides a customizable real-time heads-up display (HUD Overlay) that t
 
 ---
 
+## 📸 Preview
+
+| Horizontal Blocks Mode | Horizontal Bars Mode |
+| :---: | :---: |
+| ![Horizontal Blocks Mode](screenshots/screenshot.png) | ![Horizontal Bars Mode](screenshots/screenshot2.png) |
+
+---
+
 ## 🌟 Key Features
 
 - **High Performance & Lightweight**: Built with native C++ and Win32 GDI+ for minimal memory overhead and zero latency.
