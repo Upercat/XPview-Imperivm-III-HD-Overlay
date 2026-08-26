@@ -29,6 +29,7 @@ This mod provides a customizable real-time heads-up display (HUD Overlay) that t
   - Configurable colors for level brackets (Low, White, Brown, Gold).
   - Real-time adjustment of X/Y screen offsets and Gap Y directly from the control panel.
 - **Skill Points Notification**: Visual indicator highlights when a selected hero has unspent skill points.
+- **Optional 1–9 Control Groups**: Select **1–9 Slots Patch** in the controller to render hero data for slots 1 through 9 after installing the compatible patch. The controller includes a direct link to the patch release.
 
 ---
 
@@ -61,6 +62,7 @@ This mod provides a customizable real-time heads-up display (HUD Overlay) that t
 1. Launch **Imperivm III**.
 2. Run `hero_overlay_c++.exe`.
 3. Customize display preferences (X/Y offsets, Experience bar mode, Arabic/Roman numerals) using the overlay controls.
+4. If you use the **1–9 Slots Patch**, select **1–9 Slots Patch** under **Slots**. Leave **Standard (1–5)** selected for an unpatched game.
 
 ---
 

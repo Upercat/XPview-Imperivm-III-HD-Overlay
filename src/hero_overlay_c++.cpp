@@ -11,12 +11,14 @@
 #include <cstdlib>
 #include <cwctype>
 #include <memory>
+#include <shellapi.h>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Shell32.lib")
 
 namespace
 {
@@ -63,8 +65,14 @@ constexpr int IDC_COLOR_WHITE = 1012;
 constexpr int IDC_COLOR_BROWN = 1013;
 constexpr int IDC_COLOR_GOLD = 1014;
 constexpr int IDC_SKILL_POINTS = 1015;
+constexpr int IDC_SLOT_MODE = 1016;
+constexpr int IDC_9SLOT_PATCH_LINK = 1017;
 constexpr int kLevelFlashMs = 800;
 constexpr bool kVerboseLogging = false;
+constexpr size_t kStandardSlotCount = 5;
+constexpr size_t kPatchedSlotCount = 9;
+constexpr size_t kMaxSlotCount = kPatchedSlotCount;
+constexpr wchar_t kNineSlotsPatchUrl[] = L"https://github.com/Upercat/XPview-Imperivm-III-HD-Overlay/releases";
 
 enum class ExperienceMode
 {
@@ -84,6 +92,12 @@ enum class SkillPointsStyle
 {
     ShowAll,
     ShowIndicator,
+};
+
+enum class SlotDisplayMode
+{
+    StandardFive,
+    PatchedNine,
 };
 
 std::wstring IntToWide(int value)
@@ -438,9 +452,9 @@ public:
         return state;
     }
 
-    std::array<SlotInfo, 5> ScanHeroSlots() const
+    std::array<SlotInfo, kMaxSlotCount> ScanHeroSlots(size_t slotCount) const
     {
-        std::array<SlotInfo, 5> slots;
+        std::array<SlotInfo, kMaxSlotCount> slots;
 
         uint32_t game = ReadPtr(0x00996ff4);
         if (!IsValidPtr(game))
@@ -454,7 +468,8 @@ public:
             return slots;
         }
 
-        for (int hotkey = 1; hotkey <= 5; ++hotkey)
+        const int lastHotkey = static_cast<int>((std::min)(slotCount, kMaxSlotCount));
+        for (int hotkey = 1; hotkey <= lastHotkey; ++hotkey)
         {
             uint32_t slotAddr = player + 0x0AC + static_cast<uint32_t>(hotkey * 0x2C);
             std::vector<uint16_t> uids = ReadListUnits(slotAddr + 0x14);
@@ -767,7 +782,7 @@ public:
             CW_USEDEFAULT,
             0,
             540,
-            315,
+            355,
             nullptr,
             nullptr,
             instance_,
@@ -859,6 +874,9 @@ public:
         levelColorsEnabled_ = GetPrivateProfileIntW(L"Overlay", L"LevelColors", 0, preferencesPath_.c_str()) != 0;
         int savedSkillPointsStyle = static_cast<int>(GetPrivateProfileIntW(L"Overlay", L"SkillPointsStyle", 0, preferencesPath_.c_str()));
         skillPointsStyle_ = savedSkillPointsStyle == 1 ? SkillPointsStyle::ShowIndicator : SkillPointsStyle::ShowAll;
+        slotDisplayMode_ = GetPrivateProfileIntW(L"Overlay", L"SlotDisplayMode", 0, preferencesPath_.c_str()) == 1
+            ? SlotDisplayMode::PatchedNine
+            : SlotDisplayMode::StandardFive;
 
         wchar_t colorText[32] = {};
         GetPrivateProfileStringW(L"Colors", L"LevelBelow6", ColorToHex(levelColorLow_).c_str(), colorText, static_cast<DWORD>(std::size(colorText)), preferencesPath_.c_str());
@@ -898,6 +916,7 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"NumberStyle", numberStyle_ == NumberStyle::Roman ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"LevelColors", levelColorsEnabled_ ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"SkillPointsStyle", skillPointsStyle_ == SkillPointsStyle::ShowIndicator ? L"1" : L"0", preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"SlotDisplayMode", slotDisplayMode_ == SlotDisplayMode::PatchedNine ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"LevelBelow6", ColorToHex(levelColorLow_).c_str(), preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"Level6", ColorToHex(levelColorWhite_).c_str(), preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"Level12", ColorToHex(levelColorBrown_).c_str(), preferencesPath_.c_str());
@@ -1073,6 +1092,24 @@ private:
         SendMessageW(skillPointsCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Show indicator"));
         SendMessageW(skillPointsCombo_, CB_SETCURSEL, skillPointsStyle_ == SkillPointsStyle::ShowIndicator ? 1 : 0, 0);
 
+        slotModeLabel_ = CreateWindowW(L"STATIC", L"Slots:", WS_CHILD | WS_VISIBLE, 10, 220, 70, 22, parent, nullptr, instance_, nullptr);
+        slotModeCombo_ = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 80, 216, 180, 200, parent, reinterpret_cast<HMENU>(IDC_SLOT_MODE), instance_, nullptr);
+        SendMessageW(slotModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Standard (1-5)"));
+        SendMessageW(slotModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1-9 Slots Patch"));
+        SendMessageW(slotModeCombo_, CB_SETCURSEL, slotDisplayMode_ == SlotDisplayMode::PatchedNine ? 1 : 0, 0);
+        nineSlotsPatchLink_ = CreateWindowW(
+            L"BUTTON",
+            L"Get the 1-9 Slots Patch",
+            WS_CHILD | WS_VISIBLE | BS_FLAT,
+            290,
+            216,
+            220,
+            26,
+            parent,
+            reinterpret_cast<HMENU>(IDC_9SLOT_PATCH_LINK),
+            instance_,
+            nullptr);
+
         colorLowLabel_ = CreateWindowW(L"STATIC", L"<6:", WS_CHILD | WS_VISIBLE, 10, 180, 30, 22, parent, nullptr, instance_, nullptr);
         colorLowEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ColorToHex(levelColorLow_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 42, 176, 76, 24, parent, reinterpret_cast<HMENU>(IDC_COLOR_LOW), instance_, nullptr);
 
@@ -1086,10 +1123,10 @@ private:
         colorGoldEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ColorToHex(levelColorGold_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 416, 176, 76, 24, parent, reinterpret_cast<HMENU>(IDC_COLOR_GOLD), instance_, nullptr);
 
         applyButton_ = CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 415, 64, 105, 28, parent, reinterpret_cast<HMENU>(IDC_APPLY), instance_, nullptr);
-        testButton_ = CreateWindowW(L"BUTTON", L"TEST OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 220, 140, 32, parent, reinterpret_cast<HMENU>(IDC_TEST), instance_, nullptr);
-        exitButton_ = CreateWindowW(L"BUTTON", L"EXIT OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 380, 220, 140, 32, parent, reinterpret_cast<HMENU>(IDC_EXIT_OVERLAY), instance_, nullptr);
+        testButton_ = CreateWindowW(L"BUTTON", L"TEST OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 260, 140, 32, parent, reinterpret_cast<HMENU>(IDC_TEST), instance_, nullptr);
+        exitButton_ = CreateWindowW(L"BUTTON", L"EXIT OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 380, 260, 140, 32, parent, reinterpret_cast<HMENU>(IDC_EXIT_OVERLAY), instance_, nullptr);
 
-        std::array<HWND, 24> controls = { offsetXLabel_, offsetXEdit_, offsetYLabel_, offsetYEdit_, gapYLabel_, gapYEdit_, expModeLabel_, expModeCombo_, numberStyleLabel_, numberStyleCombo_, levelColorsCheck_, skillPointsLabel_, skillPointsCombo_, colorLowLabel_, colorLowEdit_, colorWhiteLabel_, colorWhiteEdit_, colorBrownLabel_, colorBrownEdit_, colorGoldLabel_, colorGoldEdit_, applyButton_, testButton_, exitButton_ };
+        std::array<HWND, 27> controls = { offsetXLabel_, offsetXEdit_, offsetYLabel_, offsetYEdit_, gapYLabel_, gapYEdit_, expModeLabel_, expModeCombo_, numberStyleLabel_, numberStyleCombo_, levelColorsCheck_, skillPointsLabel_, skillPointsCombo_, slotModeLabel_, slotModeCombo_, nineSlotsPatchLink_, colorLowLabel_, colorLowEdit_, colorWhiteLabel_, colorWhiteEdit_, colorBrownLabel_, colorBrownEdit_, colorGoldLabel_, colorGoldEdit_, applyButton_, testButton_, exitButton_ };
         for (HWND control : controls)
         {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
@@ -1110,6 +1147,12 @@ private:
         if (control == authorLabel_)
         {
             SetTextColor(hdc, RGB(166, 173, 200));
+            SetBkColor(hdc, kControlBg);
+            return reinterpret_cast<LRESULT>(controlBrush_);
+        }
+        if (control == nineSlotsPatchLink_)
+        {
+            SetTextColor(hdc, RGB(137, 180, 250));
             SetBkColor(hdc, kControlBg);
             return reinterpret_cast<LRESULT>(controlBrush_);
         }
@@ -1164,7 +1207,12 @@ private:
         MoveWindow(colorGoldLabel_, 374, paletteY, 38, 22, TRUE);
         MoveWindow(colorGoldEdit_, 416, paletteY - 4, 76, 24, TRUE);
 
-        int buttonY = rowY + 150;
+        int slotsY = rowY + 150;
+        MoveWindow(slotModeLabel_, 10, slotsY, 70, 22, TRUE);
+        MoveWindow(slotModeCombo_, 80, slotsY - 4, 180, 200, TRUE);
+        MoveWindow(nineSlotsPatchLink_, 290, slotsY - 4, 220, 26, TRUE);
+
+        int buttonY = rowY + 190;
         MoveWindow(testButton_, 10, buttonY, 140, 32, TRUE);
         MoveWindow(exitButton_, max(160, width - 150), buttonY, 140, 32, TRUE);
     }
@@ -1211,6 +1259,20 @@ private:
             if (notifyCode == CBN_SELCHANGE)
             {
                 ApplySkillPointsFromControl();
+            }
+            break;
+
+        case IDC_SLOT_MODE:
+            if (notifyCode == CBN_SELCHANGE)
+            {
+                ApplySlotModeFromControl();
+            }
+            break;
+
+        case IDC_9SLOT_PATCH_LINK:
+            if (notifyCode == BN_CLICKED)
+            {
+                ShellExecuteW(nullptr, L"open", kNineSlotsPatchUrl, nullptr, nullptr, SW_SHOWNORMAL);
             }
             break;
 
@@ -1330,6 +1392,27 @@ private:
         InvalidateRect(overlayWnd_, nullptr, TRUE);
     }
 
+    size_t DisplayedSlotCount() const
+    {
+        return slotDisplayMode_ == SlotDisplayMode::PatchedNine ? kPatchedSlotCount : kStandardSlotCount;
+    }
+
+    void ApplySlotModeFromControl()
+    {
+        const int selected = static_cast<int>(SendMessageW(slotModeCombo_, CB_GETCURSEL, 0, 0));
+        slotDisplayMode_ = selected == 1 ? SlotDisplayMode::PatchedNine : SlotDisplayMode::StandardFive;
+        previousSlots_ = {};
+        flashStart_ = {};
+        flashUntil_ = {};
+        flashSegments_.fill(1);
+        flashLevel_.fill(1);
+        Log(slotDisplayMode_ == SlotDisplayMode::PatchedNine
+            ? "Slot mode: 1-9 Slots Patch."
+            : "Slot mode: standard 1-5.");
+        SavePreferences();
+        InvalidateRect(overlayWnd_, nullptr, TRUE);
+    }
+
     void ToggleTestMode()
     {
         testMode_ = !testMode_;
@@ -1355,7 +1438,7 @@ private:
         InvalidateRect(overlayWnd_, nullptr, TRUE);
     }
 
-    void UpdateLevelFlashState(const std::array<SlotInfo, 5>& newSlots)
+    void UpdateLevelFlashState(const std::array<SlotInfo, kMaxSlotCount>& newSlots)
     {
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < newSlots.size(); ++i)
@@ -1462,7 +1545,7 @@ private:
             ShowWindow(overlayWnd_, SW_SHOWNOACTIVATE);
         }
 
-        slots_ = mapOverlayBlocked || !reader_ ? std::array<SlotInfo, 5>() : reader_->ScanHeroSlots();
+        slots_ = mapOverlayBlocked || !reader_ ? std::array<SlotInfo, kMaxSlotCount>() : reader_->ScanHeroSlots(DisplayedSlotCount());
         UpdateLevelFlashState(slots_);
 
         InvalidateRect(overlayWnd_, nullptr, FALSE);
@@ -1479,7 +1562,7 @@ private:
 
             std::ostringstream status;
             status << "Slots Status: ";
-            for (size_t i = 0; i < slots_.size(); ++i)
+            for (size_t i = 0; i < DisplayedSlotCount(); ++i)
             {
                 if (i > 0)
                 {
@@ -1562,7 +1645,7 @@ private:
         HBRUSH barBgBrush = CreateSolidBrush(kBarBg);
         HBRUSH blockEmptyBrush = CreateSolidBrush(kBlockEmpty);
 
-        for (size_t i = 0; i < slots_.size(); ++i)
+        for (size_t i = 0; i < DisplayedSlotCount(); ++i)
         {
             int yStart = offsetY_ + static_cast<int>(i) * gapY_;
             bool visible = slots_[i].pct >= 0 || testMode_;
@@ -1880,6 +1963,9 @@ private:
     HFONT authorFont_ = nullptr;
     HWND skillPointsLabel_ = nullptr;
     HWND skillPointsCombo_ = nullptr;
+    HWND slotModeLabel_ = nullptr;
+    HWND slotModeCombo_ = nullptr;
+    HWND nineSlotsPatchLink_ = nullptr;
     HWND offsetXLabel_ = nullptr;
     HWND offsetXEdit_ = nullptr;
     HWND offsetYLabel_ = nullptr;
@@ -1905,12 +1991,12 @@ private:
     HBRUSH controlBrush_ = CreateSolidBrush(kControlBg);
     GameProcess process_;
     std::unique_ptr<GameMemoryReader> reader_;
-    std::array<SlotInfo, 5> slots_;
-    std::array<SlotInfo, 5> previousSlots_;
-    std::array<std::chrono::steady_clock::time_point, 5> flashStart_ = {};
-    std::array<std::chrono::steady_clock::time_point, 5> flashUntil_ = {};
-    std::array<int, 5> flashSegments_ = { 1, 1, 1, 1, 1 };
-    std::array<int, 5> flashLevel_ = { 1, 1, 1, 1, 1 };
+    std::array<SlotInfo, kMaxSlotCount> slots_;
+    std::array<SlotInfo, kMaxSlotCount> previousSlots_;
+    std::array<std::chrono::steady_clock::time_point, kMaxSlotCount> flashStart_ = {};
+    std::array<std::chrono::steady_clock::time_point, kMaxSlotCount> flashUntil_ = {};
+    std::array<int, kMaxSlotCount> flashSegments_ = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    std::array<int, kMaxSlotCount> flashLevel_ = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };
     std::wstring preferencesPath_;
     int offsetX_ = 60;
     int offsetY_ = 88;
@@ -1924,6 +2010,7 @@ private:
     ExperienceMode expMode_ = ExperienceMode::Vertical;
     NumberStyle numberStyle_ = NumberStyle::Arabic;
     SkillPointsStyle skillPointsStyle_ = SkillPointsStyle::ShowAll;
+    SlotDisplayMode slotDisplayMode_ = SlotDisplayMode::StandardFive;
     bool levelColorsEnabled_ = false;
     COLORREF levelColorLow_ = RGB(146, 163, 204);
     COLORREF levelColorWhite_ = RGB(248, 250, 255);
