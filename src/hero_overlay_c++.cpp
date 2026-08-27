@@ -22,6 +22,7 @@
 #include <shellapi.h>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "User32.lib")
@@ -35,6 +36,7 @@ namespace
 {
 constexpr int kTimerId = 1;
 constexpr int kTimerMs = 100;
+constexpr int kInvalidSnapshotGraceMs = 500;
 constexpr COLORREF kTransparentColor = RGB(0, 0, 2);
 constexpr COLORREF kControlBg = RGB(30, 30, 46);
 constexpr COLORREF kLogBg = RGB(17, 17, 27);
@@ -575,6 +577,33 @@ struct SlotInfo
     std::string label = "Empty";
 };
 
+enum class ScanStatus
+{
+    Valid,
+    NotReady,
+    ChangedDuringRead,
+    InvalidRead
+};
+
+struct HeroScanResult
+{
+    ScanStatus status = ScanStatus::NotReady;
+    std::array<SlotInfo, kMaxSlotCount> slots;
+};
+
+struct UnitListResult
+{
+    ScanStatus status = ScanStatus::InvalidRead;
+    std::vector<uint16_t> unitIds;
+};
+
+enum class HeroReadStatus
+{
+    NotHero,
+    Valid,
+    ChangedDuringRead
+};
+
 struct LevelInfo
 {
     int pct = 0;
@@ -594,6 +623,7 @@ struct GameProcess
 {
     HANDLE process = nullptr;
     HWND hwnd = nullptr;
+    DWORD pid = 0;
     std::wstring title;
 };
 
@@ -709,7 +739,10 @@ GameProcess FindGameProcess(void (*logFn)(const std::string&))
         {
             logFn("[DEBUG] Process image path: " + ToNarrowLossy(imagePath));
         }
-        HANDLE readHandle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, window->pid);
+        HANDLE readHandle = OpenProcess(
+            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
+            FALSE,
+            window->pid);
         if (!readHandle)
         {
             DWORD readError = GetLastError();
@@ -724,7 +757,7 @@ GameProcess FindGameProcess(void (*logFn)(const std::string&))
         {
             logFn("[DEBUG] Successfully opened process handle for memory reading.");
         }
-        return GameProcess{ readHandle, window->hwnd, window->title };
+        return GameProcess{ readHandle, window->hwnd, window->pid, window->title };
     }
 
     return {};
@@ -749,6 +782,7 @@ public:
     {
         if (!IsValidPtr(address) || out == nullptr || size == 0)
         {
+            ++readFailureCount_;
             return false;
         }
 
@@ -762,6 +796,10 @@ public:
 
         const bool succeeded = ok && bytesRead == size;
         gPerformanceMetrics.RecordMemoryRead(size, succeeded);
+        if (!succeeded)
+        {
+            ++readFailureCount_;
+        }
         return succeeded;
     }
 
@@ -794,9 +832,10 @@ public:
         return state;
     }
 
-    std::array<SlotInfo, kMaxSlotCount> ScanHeroSlots(size_t slotCount)
+    HeroScanResult ScanHeroSlots(size_t slotCount)
     {
-        std::array<SlotInfo, kMaxSlotCount> slots;
+        HeroScanResult result;
+        const uint64_t failuresAtStart = readFailureCount_;
 
         if (expTable_.empty())
         {
@@ -809,66 +848,123 @@ public:
             {
                 // Do not expose the LevelInfo fallback as a real level while the
                 // game is still initializing its experience table.
-                return slots;
+                result.status = readFailureCount_ == failuresAtStart
+                    ? ScanStatus::NotReady
+                    : ScanStatus::InvalidRead;
+                return result;
             }
         }
 
         uint32_t game = ReadPtr(0x00996ff4);
         if (!IsValidPtr(game))
         {
-            return slots;
+            result.status = readFailureCount_ == failuresAtStart
+                ? ScanStatus::NotReady
+                : ScanStatus::InvalidRead;
+            return result;
         }
 
         uint32_t player = ReadPtr(game + 0x1514);
         if (!IsValidPtr(player))
         {
-            return slots;
+            result.status = readFailureCount_ == failuresAtStart
+                ? ScanStatus::NotReady
+                : ScanStatus::InvalidRead;
+            return result;
         }
 
         const int lastHotkey = static_cast<int>((std::min)(slotCount, kMaxSlotCount));
+        std::array<std::vector<uint16_t>, kMaxSlotCount> slotUnitIds;
         for (int hotkey = 1; hotkey <= lastHotkey; ++hotkey)
         {
             uint32_t slotAddr = player + 0x0AC + static_cast<uint32_t>(hotkey * 0x2C);
-            std::vector<uint16_t> uids = ReadListUnits(slotAddr + 0x14);
-            for (uint16_t uid : uids)
+            UnitListResult unitList = ReadListUnits(slotAddr + 0x14);
+            if (unitList.status != ScanStatus::Valid)
+            {
+                result.status = unitList.status;
+                return result;
+            }
+            slotUnitIds[static_cast<size_t>(hotkey - 1)] = unitList.unitIds;
+
+            for (uint16_t uid : unitList.unitIds)
             {
                 HeroInfo hero;
-                if (ReadHeroFromUid(uid, hero))
+                const HeroReadStatus heroStatus = ReadHeroFromUid(uid, hero);
+                if (heroStatus == HeroReadStatus::ChangedDuringRead)
                 {
-                    slots[static_cast<size_t>(hotkey - 1)].pct = hero.pct;
-                    slots[static_cast<size_t>(hotkey - 1)].level = hero.level;
-                    slots[static_cast<size_t>(hotkey - 1)].xpInLevel = hero.xpInLevel;
-                    slots[static_cast<size_t>(hotkey - 1)].xpNeeded = hero.xpNeeded;
-                    slots[static_cast<size_t>(hotkey - 1)].availableSkillPoints = hero.availableSkillPoints;
-                    slots[static_cast<size_t>(hotkey - 1)].label = hero.name.empty() ? "Hero" : hero.name;
+                    result.status = ScanStatus::ChangedDuringRead;
+                    return result;
+                }
+                if (heroStatus == HeroReadStatus::Valid)
+                {
+                    result.slots[static_cast<size_t>(hotkey - 1)].pct = hero.pct;
+                    result.slots[static_cast<size_t>(hotkey - 1)].level = hero.level;
+                    result.slots[static_cast<size_t>(hotkey - 1)].xpInLevel = hero.xpInLevel;
+                    result.slots[static_cast<size_t>(hotkey - 1)].xpNeeded = hero.xpNeeded;
+                    result.slots[static_cast<size_t>(hotkey - 1)].availableSkillPoints = hero.availableSkillPoints;
+                    result.slots[static_cast<size_t>(hotkey - 1)].label = hero.name.empty() ? "Hero" : hero.name;
                     break;
                 }
             }
         }
 
-        return slots;
+        // Re-read every list after processing all heroes. This closes the window in
+        // which a control group could change after its first validation but before
+        // the complete set of slots is published.
+        for (int hotkey = 1; hotkey <= lastHotkey; ++hotkey)
+        {
+            const uint32_t slotAddr = player + 0x0AC + static_cast<uint32_t>(hotkey * 0x2C);
+            UnitListResult currentList = ReadListUnits(slotAddr + 0x14);
+            if (currentList.status != ScanStatus::Valid)
+            {
+                result.status = currentList.status;
+                return result;
+            }
+            if (currentList.unitIds != slotUnitIds[static_cast<size_t>(hotkey - 1)])
+            {
+                result.status = ScanStatus::ChangedDuringRead;
+                return result;
+            }
+        }
+
+        const uint32_t gameAfter = ReadPtr(0x00996ff4);
+        const uint32_t playerAfter = IsValidPtr(gameAfter) ? ReadPtr(gameAfter + 0x1514) : 0;
+        if (readFailureCount_ != failuresAtStart)
+        {
+            result.status = ScanStatus::InvalidRead;
+            return result;
+        }
+        if (gameAfter != game || playerAfter != player)
+        {
+            result.status = ScanStatus::ChangedDuringRead;
+            return result;
+        }
+
+        result.status = ScanStatus::Valid;
+        return result;
     }
 
 private:
-    bool ReadHeroFromUid(uint16_t uid, HeroInfo& hero) const
+    HeroReadStatus ReadHeroFromUid(uint16_t uid, HeroInfo& hero) const
     {
         constexpr uint32_t registryAddr = 0x00a2a610;
-        uint32_t unit = ReadPtr(registryAddr + static_cast<uint32_t>(uid) * 4);
+        const uint32_t registryEntry = registryAddr + static_cast<uint32_t>(uid) * 4;
+        uint32_t unit = ReadPtr(registryEntry);
         if (unit == 0)
         {
-            return false;
+            return HeroReadStatus::NotHero;
         }
 
         uint32_t unitTemplate = ReadPtr(unit + 0x3c);
         if (!InheritsFromHero(unitTemplate))
         {
-            return false;
+            return HeroReadStatus::NotHero;
         }
 
         std::string commandState = GetStdString(unit + 0x110);
         if (commandState == "die")
         {
-            return false;
+            return HeroReadStatus::NotHero;
         }
 
         std::string customName = GetStdString(unit + 0xa0);
@@ -877,7 +973,7 @@ private:
             lowerName.find("tumba") != std::string::npos ||
             lowerName.find("corpse") != std::string::npos)
         {
-            return false;
+            return HeroReadStatus::NotHero;
         }
 
         int32_t xp = ReadInt(unit + 0x180);
@@ -890,7 +986,17 @@ private:
             ComputeAvailableSkillPoints(unit, level),
             customName.empty() ? "Hero" : customName
         };
-        return true;
+
+        // A UID can be removed and reused while the overlay is reading its fields.
+        // Reject the whole scan if the registry entry or XP changed mid-snapshot.
+        const uint32_t unitAfter = ReadPtr(registryEntry);
+        const int32_t xpAfter = ReadInt(unit + 0x180);
+        if (unitAfter != unit || xpAfter != xp)
+        {
+            return HeroReadStatus::ChangedDuringRead;
+        }
+
+        return HeroReadStatus::Valid;
     }
 
     int ComputeAvailableSkillPoints(uint32_t unit, const LevelInfo& level) const
@@ -1000,33 +1106,85 @@ private:
         return LevelInfo{ std::clamp(pct, 0, 100), static_cast<int>(level), xpInLevel, static_cast<int>(xpNeeded) };
     }
 
-    std::vector<uint16_t> ReadListUnits(uint32_t listAddr) const
+    UnitListResult ReadListUnits(uint32_t listAddr) const
     {
-        std::vector<uint16_t> unitIds;
-        uint32_t sentinel = ReadPtr(listAddr + 4);
-        int32_t size = ReadInt(listAddr + 8);
-        if (size <= 0 || size > 1000 || !IsValidPtr(sentinel))
+        struct ListHeader
         {
-            return unitIds;
+            uint32_t sentinel = 0;
+            int32_t size = 0;
+        };
+
+        UnitListResult result;
+        ListHeader before;
+        if (!ReadBytes(listAddr + 4, &before, sizeof(before)))
+        {
+            return result;
+        }
+        if (before.size < 0 || before.size > 1000)
+        {
+            return result;
         }
 
-        uint32_t current = ReadPtr(sentinel);
-        for (int32_t i = 0; i < size; ++i)
+        if (before.size == 0)
         {
-            if (current == 0 || current == sentinel || !IsValidPtr(current))
+            ListHeader after;
+            if (!ReadBytes(listAddr + 4, &after, sizeof(after)))
             {
-                break;
+                return result;
+            }
+            result.status = after.sentinel == before.sentinel && after.size == before.size
+                ? ScanStatus::Valid
+                : ScanStatus::ChangedDuringRead;
+            return result;
+        }
+
+        if (!IsValidPtr(before.sentinel))
+        {
+            return result;
+        }
+
+        uint32_t current = 0;
+        if (!ReadBytes(before.sentinel, &current, sizeof(current)))
+        {
+            return result;
+        }
+
+        std::unordered_set<uint32_t> visited;
+        result.unitIds.reserve(static_cast<size_t>(before.size));
+        for (int32_t i = 0; i < before.size; ++i)
+        {
+            if (!IsValidPtr(current) || current == before.sentinel || !visited.insert(current).second)
+            {
+                result.status = ScanStatus::ChangedDuringRead;
+                return result;
             }
 
             uint16_t uid = 0;
-            if (ReadBytes(current + 8, &uid, sizeof(uid)))
+            uint32_t next = 0;
+            if (!ReadBytes(current + 8, &uid, sizeof(uid)) ||
+                !ReadBytes(current, &next, sizeof(next)))
             {
-                unitIds.push_back(uid);
+                return result;
             }
-            current = ReadPtr(current);
+            result.unitIds.push_back(uid);
+            current = next;
         }
 
-        return unitIds;
+        ListHeader after;
+        if (!ReadBytes(listAddr + 4, &after, sizeof(after)))
+        {
+            return result;
+        }
+        if (current != before.sentinel ||
+            after.sentinel != before.sentinel ||
+            after.size != before.size)
+        {
+            result.status = ScanStatus::ChangedDuringRead;
+            return result;
+        }
+
+        result.status = ScanStatus::Valid;
+        return result;
     }
 
     std::string GetStdString(uint32_t addr) const
@@ -1101,6 +1259,7 @@ private:
 
     HANDLE process_ = nullptr;
     LogFn logFn_ = nullptr;
+    mutable uint64_t readFailureCount_ = 0;
     std::vector<int32_t> expTable_;
     std::chrono::steady_clock::time_point lastExpTableAttempt_ = {};
 };
@@ -2203,9 +2362,32 @@ private:
         previousSlots_ = newSlots;
     }
 
+    bool IsGameProcessConnected() const
+    {
+        if (!process_.process || !process_.hwnd || process_.pid == 0 || !IsWindow(process_.hwnd))
+        {
+            return false;
+        }
+
+        if (WaitForSingleObject(process_.process, 0) != WAIT_TIMEOUT)
+        {
+            return false;
+        }
+
+        DWORD windowPid = 0;
+        GetWindowThreadProcessId(process_.hwnd, &windowPid);
+        return windowPid == process_.pid;
+    }
+
+    void PublishSlots(const std::array<SlotInfo, kMaxSlotCount>& newSlots)
+    {
+        slots_ = newSlots;
+        UpdateLevelFlashState(slots_);
+    }
+
     void Tick()
     {
-        const bool processConnected = process_.process && IsWindow(process_.hwnd);
+        const bool processConnected = IsGameProcessConnected();
         if (!processConnected)
         {
             gPerformanceMetrics.SetState(PerformanceState::Disconnected);
@@ -2254,6 +2436,7 @@ private:
         if (x < -32000 || y < -32000)
         {
             gPerformanceMetrics.SetState(PerformanceState::Minimized);
+            overlayVisible_ = false;
             ShowWindow(overlayWnd_, SW_HIDE);
             return;
         }
@@ -2296,14 +2479,33 @@ private:
 
         if (mapOverlayBlocked || !reader_)
         {
-            slots_ = {};
+            hasSuccessfulScan_ = false;
+            PublishSlots({});
         }
         else
         {
             ScopedPerformanceTimer scanTimer(gPerformanceMetrics, PerformanceMetric::Scan);
-            slots_ = reader_->ScanHeroSlots(DisplayedSlotCount());
+            HeroScanResult scan = reader_->ScanHeroSlots(DisplayedSlotCount());
+            if (!IsGameProcessConnected())
+            {
+                DisconnectProcess();
+                return;
+            }
+
+            const auto scanCompletedAt = std::chrono::steady_clock::now();
+            if (scan.status == ScanStatus::Valid)
+            {
+                PublishSlots(scan.slots);
+                lastSuccessfulScan_ = scanCompletedAt;
+                hasSuccessfulScan_ = true;
+            }
+            else if (!hasSuccessfulScan_ ||
+                scanCompletedAt - lastSuccessfulScan_ > std::chrono::milliseconds(kInvalidSnapshotGraceMs))
+            {
+                hasSuccessfulScan_ = false;
+                PublishSlots({});
+            }
         }
-        UpdateLevelFlashState(slots_);
 
         InvalidateRect(overlayWnd_, nullptr, FALSE);
 
@@ -2767,13 +2969,35 @@ private:
 
     void DisconnectProcess()
     {
+        const bool wasConnected = process_.process != nullptr;
         if (process_.process)
         {
             CloseHandle(process_.process);
-            Log("Game process disconnected.");
         }
         process_ = {};
         reader_.reset();
+        slots_ = {};
+        previousSlots_ = {};
+        flashStart_ = {};
+        flashUntil_ = {};
+        flashSegments_.fill(1);
+        flashLevel_.fill(1);
+        hasSuccessfulScan_ = false;
+        lastSuccessfulScan_ = {};
+        lastX_ = -1;
+        lastY_ = -1;
+        lastWidth_ = -1;
+        lastHeight_ = -1;
+        overlayVisible_ = false;
+        if (overlayWnd_)
+        {
+            ShowWindow(overlayWnd_, SW_HIDE);
+        }
+        gPerformanceMetrics.SetState(PerformanceState::Disconnected);
+        if (wasConnected)
+        {
+            Log("Game process disconnected.");
+        }
     }
 
     void Shutdown()
@@ -2893,6 +3117,8 @@ private:
     std::chrono::steady_clock::time_point lastTopmostUpdate_ = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSearchAttempt_ = {};
     std::chrono::steady_clock::time_point lastWaitingLog_ = {};
+    std::chrono::steady_clock::time_point lastSuccessfulScan_ = {};
+    bool hasSuccessfulScan_ = false;
 
     static inline OverlayApp* instanceForLog_ = nullptr;
 };
