@@ -695,9 +695,24 @@ public:
         return state;
     }
 
-    std::array<SlotInfo, kMaxSlotCount> ScanHeroSlots(size_t slotCount) const
+    std::array<SlotInfo, kMaxSlotCount> ScanHeroSlots(size_t slotCount)
     {
         std::array<SlotInfo, kMaxSlotCount> slots;
+
+        if (expTable_.empty())
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastExpTableAttempt_ >= std::chrono::seconds(1))
+            {
+                ReadExpTable();
+            }
+            if (expTable_.empty())
+            {
+                // Do not expose the LevelInfo fallback as a real level while the
+                // game is still initializing its experience table.
+                return slots;
+            }
+        }
 
         uint32_t game = ReadPtr(0x00996ff4);
         if (!IsValidPtr(game))
@@ -820,6 +835,7 @@ private:
 
     void ReadExpTable()
     {
+        lastExpTableAttempt_ = std::chrono::steady_clock::now();
         constexpr uint32_t expTableAddr = 0x009bf880;
         std::array<int32_t, 1000> table = {};
         if (ReadBytes(expTableAddr, table.data(), table.size() * sizeof(int32_t)))
@@ -827,22 +843,24 @@ private:
             // The binary reserves a large table, but only its strictly increasing prefix is
             // populated. Reading the zero-filled tail made every positive XP value look like
             // level 1000.
-            expTable_.clear();
+            std::vector<int32_t> candidate;
             for (int32_t threshold : table)
             {
-                if (threshold < 0 || (!expTable_.empty() && threshold <= expTable_.back()))
+                if (threshold < 0 || (!candidate.empty() && threshold <= candidate.back()))
                 {
                     break;
                 }
-                expTable_.push_back(threshold);
+                candidate.push_back(threshold);
             }
-            if (expTable_.size() < 2)
+            if (candidate.size() >= 2)
             {
-                expTable_.clear();
+                expTable_ = std::move(candidate);
             }
             if (kVerboseLogging)
             {
-                Log("Loaded experience table from memory.");
+                Log(expTable_.empty()
+                    ? "Experience table is not initialized yet; retrying later."
+                    : "Loaded experience table from memory.");
             }
         }
         else
@@ -998,6 +1016,7 @@ private:
     HANDLE process_ = nullptr;
     LogFn logFn_ = nullptr;
     std::vector<int32_t> expTable_;
+    std::chrono::steady_clock::time_point lastExpTableAttempt_ = {};
 };
 
 class OverlayApp
