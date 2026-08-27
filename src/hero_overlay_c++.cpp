@@ -2,6 +2,7 @@
 
 #include "framework.h"
 #include "hero_overlay_c++.h"
+#include "version.h"
 
 #include <algorithm>
 #include <array>
@@ -1318,7 +1319,7 @@ public:
 
         mainWnd_ = CreateWindowW(
             mainClass.lpszClassName,
-            L"Imperivm Overlay Controller",
+            XPVIEW_CONTROLLER_TITLE_W,
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             0,
@@ -1337,7 +1338,7 @@ public:
         overlayWnd_ = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             overlayClass.lpszClassName,
-            L"Imperivm Hero Overlay",
+            XPVIEW_OVERLAY_TITLE_W,
             WS_POPUP,
             0,
             0,
@@ -1771,7 +1772,7 @@ private:
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Calibri");
 
-        titleLabel_ = CreateWindowW(L"STATIC", L"XPview", WS_CHILD | WS_VISIBLE, 15, 12, 150, 32, parent, nullptr, instance_, nullptr);
+        titleLabel_ = CreateWindowW(L"STATIC", L"XPview " XPVIEW_VERSION_STRING_W, WS_CHILD | WS_VISIBLE, 15, 12, 190, 32, parent, nullptr, instance_, nullptr);
         authorLabel_ = CreateWindowW(L"STATIC", L"Created by Upercat", WS_CHILD | WS_VISIBLE, 15, 42, 200, 18, parent, nullptr, instance_, nullptr);
 
         SendMessageW(titleLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
@@ -2048,7 +2049,11 @@ private:
             break;
 
         case IDM_ABOUT:
-            MessageBoxW(mainWnd_, L"Imperivm Hero Overlay C++ port", L"About", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(
+                mainWnd_,
+                L"XPview " XPVIEW_VERSION_STRING_W L"\nImperivm III Hero Overlay\nCreated by Upercat",
+                L"About XPview",
+                MB_OK | MB_ICONINFORMATION);
             break;
         }
     }

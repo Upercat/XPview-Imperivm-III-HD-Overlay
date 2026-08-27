@@ -1,5 +1,7 @@
 # Hero Overlay C++ for Imperivm III
 
+Current stable version: **XPview 1.1.0**
+
 A high-performance, native Win32 floating HUD Overlay written in C++ for **Imperivm III: Great Battles of Rome** (*Imperivm III: Las Grandes Batallas de la Historia*).
 
 This mod provides a customizable real-time heads-up display (HUD Overlay) that tracks and presents Hero information, including Level, Experience progress bar, and unassigned Skill Points.
@@ -68,6 +70,8 @@ This mod provides a customizable real-time heads-up display (HUD Overlay) that t
 
 ## 📄 License
 
-This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. See the [LICENSE](file:///F:/dev_Imperivm4/visual_studio/hero_overlay_c++/LICENSE) file for details.
+This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. See the [LICENSE](LICENSE) file for details.
+
+Release history and technical details are available in [CHANGELOG.md](CHANGELOG.md).
 
 > **GPLv3 Summary**: You are free to run, study, share, and modify this software. However, any redistributed modified versions or derivative works must also be released open source under the same GPLv3 license with accessible source code.
