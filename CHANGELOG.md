@@ -21,13 +21,6 @@ XPview 1.1.0 is the first release promoted from Beta to Stable.
 - Opt-in performance diagnostics for development builds, including measurements for `Tick()`, `ScanHeroSlots()`, `ReadProcessMemory`, repaint rate, `PaintOverlay()` and approximate CPU use.
 - Performance metrics separated by runtime state: active gameplay, map hidden, minimized and disconnected.
 
-### Changed
-
-- Mixed control groups keep displaying the first valid hero found. This allows a group containing several units or heroes to remain identifiable by a relevant hero level without requiring a more expensive full-group presentation.
-- Preview rendering now preserves the source placeholder's aspect ratio and updates immediately when the experience-bar mode or anchor values change.
-- Level text and experience bars use the same positioning rules in the preview and in the real in-game overlay.
-- The application and executable metadata now identify the stable version as XPview 1.1.0.
-
 ### Fixed
 
 - Fixed heroes incorrectly appearing at level 1000. The game reserves 1000 entries for its experience table, but only the strictly increasing prefix contains valid XP thresholds. The previous reader included the uninitialized or zero-filled tail and could advance to the final table index. XPview now stops at the first negative, repeated or non-increasing threshold and rejects incomplete tables.
@@ -40,6 +33,7 @@ XPview 1.1.0 is the first release promoted from Beta to Stable.
 - Reduced visual instability during transient memory changes by retaining the last valid snapshot for up to 500 ms instead of immediately replacing it with invalid data.
 - Fixed the overlay sometimes remaining hidden after the game was minimized and restored.
 - Fixed preview alignment, scaling and hit-testing inconsistencies, including the lower part of vertical experience bars not being draggable.
+- Fixed placeholder discovery in packaged builds. The preview artwork is now loaded from beside `XPview.exe`, with the source-tree location retained as a development fallback.
 
 ### Diagnostics
 

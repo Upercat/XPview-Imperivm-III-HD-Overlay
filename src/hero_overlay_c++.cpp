@@ -1284,7 +1284,14 @@ public:
         if (Gdiplus::GdiplusStartup(&gdiplusToken_, &gdiplusInput, nullptr) == Gdiplus::Ok)
         {
             const std::filesystem::path exeDir = std::filesystem::path(preferencesPath_).parent_path();
-            const std::filesystem::path placeholderPath = exeDir.parent_path().parent_path() / L"placeholder2.png";
+            std::filesystem::path placeholderPath = exeDir / L"placeholder2.png";
+            std::error_code placeholderError;
+            if (!std::filesystem::exists(placeholderPath, placeholderError))
+            {
+                // Development builds live under src/Debug or src/Release, while
+                // published builds keep the preview asset beside the executable.
+                placeholderPath = exeDir.parent_path().parent_path() / L"placeholder2.png";
+            }
             placeholderPreview_ = std::make_unique<Gdiplus::Image>(placeholderPath.c_str());
             if (placeholderPreview_->GetLastStatus() != Gdiplus::Ok)
             {
