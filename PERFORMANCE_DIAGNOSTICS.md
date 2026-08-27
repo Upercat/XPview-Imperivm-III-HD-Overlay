@@ -8,8 +8,10 @@ sample timings, query CPU usage, or write diagnostic output.
 ## Output
 
 Instrumented builds create `hero_overlay_performance.log` beside the executable.
-A summary is appended every five seconds and is also sent to the Visual Studio
-debug output. Each row contains:
+Summaries are appended every five seconds and are also sent to the Visual Studio
+debug output. A reporting interval can produce multiple rows: time, CPU, reads,
+timings, and paints are accumulated independently for every runtime state visited
+during those five seconds. Each row contains:
 
 - current runtime state: `active`, `map-hidden`, `minimized`, or `disconnected`;
 - overlay process CPU usage, normalized across the available logical processors;

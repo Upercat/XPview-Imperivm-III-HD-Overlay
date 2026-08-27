@@ -139,6 +139,7 @@ enum class PerformanceState
     Active,
     MapHidden,
     Minimized,
+    Count,
 };
 
 const char* PerformanceStateName(PerformanceState state)
@@ -180,30 +181,35 @@ struct TimingAccumulator
     }
 };
 
-class ScopedPerformanceTimer
+enum class PerformanceMetric
 {
-public:
-    explicit ScopedPerformanceTimer(TimingAccumulator& accumulator) : accumulator_(accumulator)
-    {
-        if constexpr (kPerformanceInstrumentation)
-        {
-            started_ = std::chrono::steady_clock::now();
-        }
-    }
+    Tick,
+    Scan,
+    Paint,
+};
 
-    ~ScopedPerformanceTimer()
-    {
-        if constexpr (kPerformanceInstrumentation)
-        {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - started_);
-            accumulator_.Add(static_cast<uint64_t>(elapsed.count()));
-        }
-    }
+struct StatePerformanceMetrics
+{
+    TimingAccumulator tick;
+    TimingAccumulator scan;
+    TimingAccumulator paint;
+    uint64_t wallMicroseconds = 0;
+    uint64_t cpuTime100ns = 0;
+    uint64_t readCalls = 0;
+    uint64_t readBytes = 0;
+    uint64_t readFailures = 0;
 
-private:
-    TimingAccumulator& accumulator_;
-    std::chrono::steady_clock::time_point started_ = {};
+    void Reset()
+    {
+        tick.Reset();
+        scan.Reset();
+        paint.Reset();
+        wallMicroseconds = 0;
+        cpuTime100ns = 0;
+        readCalls = 0;
+        readBytes = 0;
+        readFailures = 0;
+    }
 };
 
 class PerformanceMetrics
@@ -220,20 +226,49 @@ public:
         std::ofstream log(logPath_, std::ios::trunc);
         log << "XPview performance diagnostics\n"
             << "Build: " << (kPerformanceInstrumentation ? "instrumented" : "normal") << "\n"
-            << "Columns: state, CPU, Tick, ScanHeroSlots, ReadProcessMemory, PaintOverlay\n";
+            << "Aggregation: metrics are separated by runtime state inside each reporting interval\n"
+            << "Columns: state, state time, CPU, Tick, ScanHeroSlots, ReadProcessMemory, PaintOverlay\n";
 
         reportStarted_ = std::chrono::steady_clock::now();
-        lastCpuTime100ns_ = ReadProcessCpuTime100ns();
+        stateStarted_ = reportStarted_;
+        lastStateCpuTime100ns_ = ReadProcessCpuTime100ns();
         SYSTEM_INFO systemInfo = {};
         GetSystemInfo(&systemInfo);
         processorCount_ = (std::max)(1u, static_cast<unsigned int>(systemInfo.dwNumberOfProcessors));
+        initialized_ = true;
     }
 
     void SetState(PerformanceState state)
     {
         if constexpr (kPerformanceInstrumentation)
         {
+            if (!initialized_ || state == state_)
+            {
+                state_ = state;
+                return;
+            }
+            AccumulateCurrentState(std::chrono::steady_clock::now());
             state_ = state;
+        }
+    }
+
+    void RecordTiming(PerformanceMetric metric, uint64_t microseconds)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            StatePerformanceMetrics& metrics = CurrentMetrics();
+            switch (metric)
+            {
+            case PerformanceMetric::Scan:
+                metrics.scan.Add(microseconds);
+                break;
+            case PerformanceMetric::Paint:
+                metrics.paint.Add(microseconds);
+                break;
+            default:
+                metrics.tick.Add(microseconds);
+                break;
+            }
         }
     }
 
@@ -241,11 +276,12 @@ public:
     {
         if constexpr (kPerformanceInstrumentation)
         {
-            ++readCalls_;
-            readBytes_ += static_cast<uint64_t>(bytes);
+            StatePerformanceMetrics& metrics = CurrentMetrics();
+            ++metrics.readCalls;
+            metrics.readBytes += static_cast<uint64_t>(bytes);
             if (!succeeded)
             {
-                ++readFailures_;
+                ++metrics.readFailures;
             }
         }
     }
@@ -264,42 +300,46 @@ public:
             return;
         }
 
-        const uint64_t cpuTime100ns = ReadProcessCpuTime100ns();
-        const uint64_t cpuDelta100ns = cpuTime100ns >= lastCpuTime100ns_ ? cpuTime100ns - lastCpuTime100ns_ : 0;
-        const double cpuPercent = seconds > 0.0
-            ? (static_cast<double>(cpuDelta100ns) / (seconds * 10000000.0 * processorCount_)) * 100.0
-            : 0.0;
-
-        std::ostringstream line;
-        line << std::fixed << std::setprecision(2)
-            << "[PERF] state=" << PerformanceStateName(state_)
-            << " window_s=" << seconds
-            << " cpu=" << cpuPercent << "%"
-            << " tick={count:" << tick_.count << ",avg_us:" << Average(tick_) << ",max_us:" << tick_.maximumMicroseconds << "}"
-            << " scan={count:" << scan_.count << ",avg_us:" << Average(scan_) << ",max_us:" << scan_.maximumMicroseconds << "}"
-            << " rpm={calls:" << readCalls_ << ",calls_s:" << (readCalls_ / seconds)
-            << ",bytes:" << readBytes_ << ",bytes_s:" << (readBytes_ / seconds) << ",failures:" << readFailures_ << "}"
-            << " paint={count:" << paint_.count << ",fps:" << (paint_.count / seconds)
-            << ",avg_us:" << Average(paint_) << ",max_us:" << paint_.maximumMicroseconds << "}";
-
-        const std::string text = line.str();
-        OutputDebugStringA((text + "\n").c_str());
+        AccumulateCurrentState(now);
         std::ofstream log(logPath_, std::ios::app);
-        log << text << '\n';
+        constexpr std::array<PerformanceState, 4> states = {
+            PerformanceState::Disconnected,
+            PerformanceState::Active,
+            PerformanceState::MapHidden,
+            PerformanceState::Minimized,
+        };
+        for (PerformanceState state : states)
+        {
+            StatePerformanceMetrics& metrics = MetricsFor(state);
+            const double stateSeconds = static_cast<double>(metrics.wallMicroseconds) / 1000000.0;
+            if (stateSeconds <= 0.0)
+            {
+                continue;
+            }
+            const double cpuPercent = (static_cast<double>(metrics.cpuTime100ns) /
+                (stateSeconds * 10000000.0 * processorCount_)) * 100.0;
 
-        tick_.Reset();
-        scan_.Reset();
-        paint_.Reset();
-        readCalls_ = 0;
-        readBytes_ = 0;
-        readFailures_ = 0;
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(2)
+                << "[PERF] state=" << PerformanceStateName(state)
+                << " window_s=" << stateSeconds
+                << " cpu=" << cpuPercent << "%"
+                << " tick={count:" << metrics.tick.count << ",avg_us:" << Average(metrics.tick) << ",max_us:" << metrics.tick.maximumMicroseconds << "}"
+                << " scan={count:" << metrics.scan.count << ",avg_us:" << Average(metrics.scan) << ",max_us:" << metrics.scan.maximumMicroseconds << "}"
+                << " rpm={calls:" << metrics.readCalls << ",calls_s:" << (metrics.readCalls / stateSeconds)
+                << ",bytes:" << metrics.readBytes << ",bytes_s:" << (metrics.readBytes / stateSeconds) << ",failures:" << metrics.readFailures << "}"
+                << " paint={count:" << metrics.paint.count << ",fps:" << (metrics.paint.count / stateSeconds)
+                << ",avg_us:" << Average(metrics.paint) << ",max_us:" << metrics.paint.maximumMicroseconds << "}";
+
+            const std::string text = line.str();
+            OutputDebugStringA((text + "\n").c_str());
+            log << text << '\n';
+            metrics.Reset();
+        }
+
         reportStarted_ = now;
-        lastCpuTime100ns_ = cpuTime100ns;
+        stateStarted_ = now;
     }
-
-    TimingAccumulator tick_;
-    TimingAccumulator scan_;
-    TimingAccumulator paint_;
 
 private:
     static uint64_t FileTimeToUint64(const FILETIME& fileTime)
@@ -330,14 +370,72 @@ private:
             : 0.0;
     }
 
+    static size_t StateIndex(PerformanceState state)
+    {
+        return static_cast<size_t>(state);
+    }
+
+    StatePerformanceMetrics& MetricsFor(PerformanceState state)
+    {
+        return stateMetrics_[StateIndex(state)];
+    }
+
+    StatePerformanceMetrics& CurrentMetrics()
+    {
+        return MetricsFor(state_);
+    }
+
+    void AccumulateCurrentState(std::chrono::steady_clock::time_point now)
+    {
+        StatePerformanceMetrics& metrics = CurrentMetrics();
+        const auto wallElapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - stateStarted_);
+        metrics.wallMicroseconds += static_cast<uint64_t>((std::max)(int64_t{ 0 }, wallElapsed.count()));
+
+        const uint64_t cpuTime100ns = ReadProcessCpuTime100ns();
+        if (cpuTime100ns >= lastStateCpuTime100ns_)
+        {
+            metrics.cpuTime100ns += cpuTime100ns - lastStateCpuTime100ns_;
+        }
+        stateStarted_ = now;
+        lastStateCpuTime100ns_ = cpuTime100ns;
+    }
+
     std::filesystem::path logPath_;
     std::chrono::steady_clock::time_point reportStarted_ = {};
-    uint64_t lastCpuTime100ns_ = 0;
+    std::chrono::steady_clock::time_point stateStarted_ = {};
+    uint64_t lastStateCpuTime100ns_ = 0;
     unsigned int processorCount_ = 1;
     PerformanceState state_ = PerformanceState::Disconnected;
-    uint64_t readCalls_ = 0;
-    uint64_t readBytes_ = 0;
-    uint64_t readFailures_ = 0;
+    bool initialized_ = false;
+    std::array<StatePerformanceMetrics, static_cast<size_t>(PerformanceState::Count)> stateMetrics_ = {};
+};
+
+class ScopedPerformanceTimer
+{
+public:
+    ScopedPerformanceTimer(PerformanceMetrics& metrics, PerformanceMetric metric)
+        : metrics_(metrics), metric_(metric)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            started_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~ScopedPerformanceTimer()
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started_);
+            metrics_.RecordTiming(metric_, static_cast<uint64_t>(elapsed.count()));
+        }
+    }
+
+private:
+    PerformanceMetrics& metrics_;
+    PerformanceMetric metric_;
+    std::chrono::steady_clock::time_point started_ = {};
 };
 
 PerformanceMetrics gPerformanceMetrics;
@@ -2107,13 +2205,14 @@ private:
 
     void Tick()
     {
-        ScopedPerformanceTimer tickTimer(gPerformanceMetrics.tick_);
-        gPerformanceMetrics.SetState(
-            process_.process && IsWindow(process_.hwnd)
-                ? PerformanceState::Active
-                : PerformanceState::Disconnected);
+        const bool processConnected = process_.process && IsWindow(process_.hwnd);
+        if (!processConnected)
+        {
+            gPerformanceMetrics.SetState(PerformanceState::Disconnected);
+        }
+        ScopedPerformanceTimer tickTimer(gPerformanceMetrics, PerformanceMetric::Tick);
 
-        if (!process_.process || !IsWindow(process_.hwnd))
+        if (!processConnected)
         {
             DisconnectProcess();
             auto now = std::chrono::steady_clock::now();
@@ -2136,6 +2235,7 @@ private:
             }
 
             process_ = found;
+            gPerformanceMetrics.SetState(PerformanceState::Active);
             reader_ = std::make_unique<GameMemoryReader>(process_.process, StaticLog);
             lastWaitingLog_ = std::chrono::steady_clock::now();
             Log("Successfully connected to game window: '" + ToNarrowLossy(process_.title) + "'");
@@ -2200,7 +2300,7 @@ private:
         }
         else
         {
-            ScopedPerformanceTimer scanTimer(gPerformanceMetrics.scan_);
+            ScopedPerformanceTimer scanTimer(gPerformanceMetrics, PerformanceMetric::Scan);
             slots_ = reader_->ScanHeroSlots(DisplayedSlotCount());
         }
         UpdateLevelFlashState(slots_);
@@ -2245,7 +2345,7 @@ private:
 
     void PaintOverlay(HWND hwnd)
     {
-        ScopedPerformanceTimer paintTimer(gPerformanceMetrics.paint_);
+        ScopedPerformanceTimer paintTimer(gPerformanceMetrics, PerformanceMetric::Paint);
         PAINTSTRUCT ps = {};
         HDC hdc = BeginPaint(hwnd, &ps);
         if (!hdc)
