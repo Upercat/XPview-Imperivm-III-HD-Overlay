@@ -10,6 +10,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwctype>
+#include <commctrl.h>
+#include <windowsx.h>
+#include <filesystem>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <memory>
 #include <shellapi.h>
 #include <sstream>
@@ -19,6 +24,9 @@
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Gdi32.lib")
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Gdiplus.lib")
+#pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Msimg32.lib")
 
 namespace
 {
@@ -49,6 +57,7 @@ constexpr COLORREF kBlockEmpty = RGB(120, 101, 58);
 constexpr COLORREF kBlockFilled = RGB(255, 219, 88);
 constexpr COLORREF kBlockOutline = RGB(255, 232, 120);
 constexpr COLORREF kLevelTextColor = RGB(255, 232, 120);
+constexpr COLORREF kLevelTextBackground = RGB(18, 18, 28);
 
 constexpr int IDC_LOG = 1001;
 constexpr int IDC_OFFSET_X = 1002;
@@ -67,6 +76,21 @@ constexpr int IDC_COLOR_GOLD = 1014;
 constexpr int IDC_SKILL_POINTS = 1015;
 constexpr int IDC_SLOT_MODE = 1016;
 constexpr int IDC_9SLOT_PATCH_LINK = 1017;
+constexpr int IDC_LEVEL_ANCHOR_X = 1018;
+constexpr int IDC_LEVEL_ANCHOR_Y = 1019;
+constexpr int IDC_XP_ANCHOR_X = 1022;
+constexpr int IDC_XP_ANCHOR_Y = 1023;
+constexpr int IDC_RESET_ANCHORS = 1024;
+constexpr int IDC_LEVEL_TEXT_BACKGROUND = 1025;
+constexpr int kAnchorMin = -120;
+constexpr int kAnchorMax = 80;
+// In placeholder.png the slot begins at x=8, while the stable overlay's
+// OffsetX points to the XP bar immediately after the 52 px-wide portrait.
+constexpr int kPreviewStableOverlayX = 51;
+constexpr int kAnchorLayoutVersion = 2;
+constexpr int kPreviewPlaceholderWidth = 206;
+constexpr int kPreviewPlaceholderHeight = 95;
+constexpr int kPreviewScale = 2;
 constexpr int kLevelFlashMs = 800;
 constexpr bool kVerboseLogging = false;
 constexpr size_t kStandardSlotCount = 5;
@@ -548,6 +572,11 @@ private:
         int skillSlots = 0;
         for (int8_t skillLevel : skills)
         {
+            if (skillLevel < -1 || skillLevel > 10)
+            {
+                // A torn/mismatched hero snapshot must not be rendered as dozens of '+'.
+                return 0;
+            }
             if (skillLevel >= 0)
             {
                 totalSpent += skillLevel;
@@ -576,7 +605,22 @@ private:
         std::array<int32_t, 1000> table = {};
         if (ReadBytes(expTableAddr, table.data(), table.size() * sizeof(int32_t)))
         {
-            expTable_.assign(table.begin(), table.end());
+            // The binary reserves a large table, but only its strictly increasing prefix is
+            // populated. Reading the zero-filled tail made every positive XP value look like
+            // level 1000.
+            expTable_.clear();
+            for (int32_t threshold : table)
+            {
+                if (threshold < 0 || (!expTable_.empty() && threshold <= expTable_.back()))
+                {
+                    break;
+                }
+                expTable_.push_back(threshold);
+            }
+            if (expTable_.size() < 2)
+            {
+                expTable_.clear();
+            }
             if (kVerboseLogging)
             {
                 Log("Loaded experience table from memory.");
@@ -595,7 +639,7 @@ private:
             return {};
         }
 
-        size_t level = 1;
+        size_t level = 0;
         for (size_t i = 1; i < expTable_.size(); ++i)
         {
             if (expTable_[i] > xp)
@@ -608,7 +652,7 @@ private:
         }
 
         int32_t currentLevelXp = expTable_[level];
-        int32_t nextLevelXp = level + 1 < expTable_.size() ? expTable_[level + 1] : currentLevelXp;
+        int32_t nextLevelXp = level + 1 < expTable_.size() ? expTable_[level + 1] : currentLevelXp + 1;
         int32_t xpNeeded = nextLevelXp - currentLevelXp;
         if (xpNeeded == 0)
         {
@@ -749,6 +793,19 @@ public:
         instanceForLog_ = this;
         BuildPreferencesPath();
         LoadPreferences();
+        INITCOMMONCONTROLSEX controls = { sizeof(controls), ICC_BAR_CLASSES };
+        InitCommonControlsEx(&controls);
+        Gdiplus::GdiplusStartupInput gdiplusInput;
+        if (Gdiplus::GdiplusStartup(&gdiplusToken_, &gdiplusInput, nullptr) == Gdiplus::Ok)
+        {
+            const std::filesystem::path exeDir = std::filesystem::path(preferencesPath_).parent_path();
+            const std::filesystem::path placeholderPath = exeDir.parent_path().parent_path() / L"placeholder2.png";
+            placeholderPreview_ = std::make_unique<Gdiplus::Image>(placeholderPath.c_str());
+            if (placeholderPreview_->GetLastStatus() != Gdiplus::Ok)
+            {
+                placeholderPreview_.reset();
+            }
+        }
 
         WNDCLASSEXW mainClass = {};
         mainClass.cbSize = sizeof(mainClass);
@@ -781,8 +838,8 @@ public:
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             0,
-            540,
-            355,
+            1100,
+            520,
             nullptr,
             nullptr,
             instance_,
@@ -872,8 +929,29 @@ public:
         }
         numberStyle_ = GetPrivateProfileIntW(L"Overlay", L"NumberStyle", 0, preferencesPath_.c_str()) == 1 ? NumberStyle::Roman : NumberStyle::Arabic;
         levelColorsEnabled_ = GetPrivateProfileIntW(L"Overlay", L"LevelColors", 0, preferencesPath_.c_str()) != 0;
+        levelTextBackgroundEnabled_ = GetPrivateProfileIntW(L"Overlay", L"LevelTextBackground", 0, preferencesPath_.c_str()) != 0;
         int savedSkillPointsStyle = static_cast<int>(GetPrivateProfileIntW(L"Overlay", L"SkillPointsStyle", 0, preferencesPath_.c_str()));
         skillPointsStyle_ = savedSkillPointsStyle == 1 ? SkillPointsStyle::ShowIndicator : SkillPointsStyle::ShowAll;
+        const int savedAnchorLayoutVersion = static_cast<int>(GetPrivateProfileIntW(L"Anchors", L"LayoutVersion", 0, preferencesPath_.c_str()));
+        levelAnchorX_ = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Anchors", L"LevelX", 8, preferencesPath_.c_str())), kAnchorMin, kAnchorMax);
+        levelAnchorY_ = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Anchors", L"LevelY", 0, preferencesPath_.c_str())), kAnchorMin, kAnchorMax);
+        xpAnchorX_ = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Anchors", L"XpX", 0, preferencesPath_.c_str())), kAnchorMin, kAnchorMax);
+        xpAnchorY_ = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Anchors", L"XpY", 0, preferencesPath_.c_str())), kAnchorMin, kAnchorMax);
+        // Anchor coordinates from earlier experimental previews used a different
+        // reference system. Start that layout once from the stable defaults.
+        if (savedAnchorLayoutVersion < kAnchorLayoutVersion)
+        {
+            levelAnchorX_ = 8;
+            levelAnchorY_ = 0;
+            xpAnchorX_ = 0;
+            xpAnchorY_ = 0;
+        }
+        // Migrate the incorrect preview-derived preset shipped by the previous lab build.
+        if (levelAnchorX_ == 66 && levelAnchorY_ == 0 && xpAnchorX_ == 58 && xpAnchorY_ == 0)
+        {
+            levelAnchorX_ = 8;
+            xpAnchorX_ = 0;
+        }
         slotDisplayMode_ = GetPrivateProfileIntW(L"Overlay", L"SlotDisplayMode", 0, preferencesPath_.c_str()) == 1
             ? SlotDisplayMode::PatchedNine
             : SlotDisplayMode::StandardFive;
@@ -915,8 +993,14 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"ExperienceMode", experienceModeValue, preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"NumberStyle", numberStyle_ == NumberStyle::Roman ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"LevelColors", levelColorsEnabled_ ? L"1" : L"0", preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"LevelTextBackground", levelTextBackgroundEnabled_ ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"SkillPointsStyle", skillPointsStyle_ == SkillPointsStyle::ShowIndicator ? L"1" : L"0", preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Overlay", L"SlotDisplayMode", slotDisplayMode_ == SlotDisplayMode::PatchedNine ? L"1" : L"0", preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Anchors", L"LevelX", IntToWide(levelAnchorX_).c_str(), preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Anchors", L"LevelY", IntToWide(levelAnchorY_).c_str(), preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Anchors", L"XpX", IntToWide(xpAnchorX_).c_str(), preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Anchors", L"XpY", IntToWide(xpAnchorY_).c_str(), preferencesPath_.c_str());
+        WritePrivateProfileStringW(L"Anchors", L"LayoutVersion", IntToWide(kAnchorLayoutVersion).c_str(), preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"LevelBelow6", ColorToHex(levelColorLow_).c_str(), preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"Level6", ColorToHex(levelColorWhite_).c_str(), preferencesPath_.c_str());
         WritePrivateProfileStringW(L"Colors", L"Level12", ColorToHex(levelColorBrown_).c_str(), preferencesPath_.c_str());
@@ -996,6 +1080,29 @@ private:
             LayoutControls();
             return 0;
 
+        case WM_PAINT:
+            PaintAnchorReference(hwnd);
+            return 0;
+
+        case WM_LBUTTONDOWN:
+            BeginAnchorDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+
+        case WM_MOUSEMOVE:
+            if (draggedAnchor_ >= 0)
+            {
+                UpdateAnchorDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            }
+            return 0;
+
+        case WM_LBUTTONUP:
+            if (draggedAnchor_ >= 0)
+            {
+                draggedAnchor_ = -1;
+                ReleaseCapture();
+            }
+            return 0;
+
         case WM_DESTROY:
             Shutdown();
             PostQuitMessage(0);
@@ -1021,6 +1128,148 @@ private:
         }
 
         return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK AnchorEditSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR refData)
+    {
+        auto* app = reinterpret_cast<OverlayApp*>(refData);
+        switch (message)
+        {
+        case WM_LBUTTONDOWN:
+            app->scrubEdit_ = hwnd;
+            app->scrubStartX_ = GET_X_LPARAM(lParam);
+            app->scrubStartValue_ = app->ReadIntEdit(hwnd, 0);
+            app->scrubMoved_ = false;
+            SetCapture(hwnd);
+            break;
+        case WM_MOUSEMOVE:
+            if (app->scrubEdit_ == hwnd && (wParam & MK_LBUTTON))
+            {
+                const int delta = (GET_X_LPARAM(lParam) - app->scrubStartX_) / 3;
+                if (delta != 0)
+                {
+                    app->scrubMoved_ = true;
+                    const int value = std::clamp(app->scrubStartValue_ + delta, kAnchorMin, kAnchorMax);
+                    SetWindowTextW(hwnd, IntToWide(value).c_str());
+                    app->ApplyAnchorControls();
+                }
+                return 0;
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (app->scrubEdit_ == hwnd)
+            {
+                const bool moved = app->scrubMoved_;
+                app->scrubEdit_ = nullptr;
+                ReleaseCapture();
+                if (moved)
+                {
+                    return 0;
+                }
+            }
+            break;
+        }
+        return DefSubclassProc(hwnd, message, wParam, lParam);
+    }
+
+    void PaintAnchorReference(HWND hwnd)
+    {
+        PAINTSTRUCT ps = {};
+        HDC screenDc = BeginPaint(hwnd, &ps);
+        constexpr int previewX = 610;
+        constexpr int previewY = 110;
+        constexpr int previewPaintHeight = kPreviewPlaceholderHeight * kPreviewScale + 24;
+        RECT clientRect = {};
+        GetClientRect(hwnd, &clientRect);
+        HDC bufferDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+        HBITMAP bufferBitmap = bufferDc ? CreateCompatibleBitmap(screenDc, clientRect.right, clientRect.bottom) : nullptr;
+        HGDIOBJ oldBufferBitmap = bufferBitmap ? SelectObject(bufferDc, bufferBitmap) : nullptr;
+        HDC hdc = bufferBitmap ? bufferDc : screenDc;
+        if (bufferBitmap)
+        {
+            RECT previewArea = {
+                previewX,
+                previewY,
+                previewX + kPreviewPlaceholderWidth * kPreviewScale,
+                previewY + previewPaintHeight
+            };
+            FillRect(hdc, &previewArea, controlBrush_);
+        }
+        if (hdc && placeholderPreview_)
+        {
+            constexpr int scale = kPreviewScale;
+            Gdiplus::Graphics graphics(hdc);
+            graphics.DrawImage(placeholderPreview_.get(), previewX, previewY, kPreviewPlaceholderWidth * scale, kPreviewPlaceholderHeight * scale);
+
+            auto marker = [&](int x, int y, COLORREF color) {
+                HPEN pen = CreatePen(PS_SOLID, 2, color);
+                HGDIOBJ oldPen = SelectObject(hdc, pen);
+                HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Ellipse(hdc, x - 4, y - 4, x + 4, y + 4);
+                SelectObject(hdc, oldBrush);
+                SelectObject(hdc, oldPen);
+                DeleteObject(pen);
+            };
+
+            const int originX = previewX + 8 * scale;
+            const int originY = previewY + 16 * scale;
+            const int savedDc = SaveDC(hdc);
+            IntersectClipRect(hdc, previewX, previewY, previewX + kPreviewPlaceholderWidth * scale, previewY + kPreviewPlaceholderHeight * scale);
+            marker(originX, originY, RGB(255, 255, 255));
+
+            // Render the selected experience mode with the same routines and geometry as the overlay.
+            const int experienceX = originX + (kPreviewStableOverlayX + xpAnchorX_) * scale;
+            const int experienceY = originY + xpAnchorY_ * scale;
+            if (expMode_ == ExperienceMode::Vertical)
+            {
+                HBRUSH xpBackground = CreateSolidBrush(kBarBg);
+                HBRUSH xpFill = CreateSolidBrush(kBarFg);
+                RECT background = { experienceX, experienceY, experienceX + kIndicatorWidth * scale, experienceY + kIndicatorHeight * scale };
+                RECT fill = { experienceX, experienceY + 18 * scale, experienceX + kIndicatorWidth * scale, experienceY + kIndicatorHeight * scale };
+                FillRect(hdc, &background, xpBackground);
+                FillRect(hdc, &fill, xpFill);
+                DeleteObject(xpFill);
+                DeleteObject(xpBackground);
+
+                PaintLevelText(hdc, 13, 1, originX + (kPreviewStableOverlayX + levelAnchorX_) * scale, originY + levelAnchorY_ * scale, 60 * scale, DT_LEFT, scale, true);
+            }
+            else
+            {
+                HBRUSH emptyBrush = CreateSolidBrush(kBlockEmpty);
+                HBRUSH fillBrush = CreateSolidBrush(GetExperienceFillColor(13, false, kBlockFilled));
+                const COLORREF outlineColor = levelColorsEnabled_ ? BrightenColor(GetLevelBaseColor(13), 35) : kBlockOutline;
+                const int horizontalLevelX = originX + (kPreviewStableOverlayX + levelAnchorX_ - kHorizontalPaddingX) * scale;
+                const int horizontalLevelY = originY + (levelAnchorY_ + kLevelTextYOffset) * scale;
+                PaintLevelText(hdc, 13, 1, horizontalLevelX, horizontalLevelY, 180 * scale, DT_LEFT, scale, true);
+                PaintHorizontalBlocks(hdc, emptyBrush, fillBrush, outlineColor, experienceX, experienceY, 13, 5, 10, true, expMode_, scale);
+                DeleteObject(fillBrush);
+                DeleteObject(emptyBrush);
+            }
+            RestoreDC(hdc, savedDc);
+            SetTextColor(hdc, RGB(205, 214, 244));
+            SetBkMode(hdc, TRANSPARENT);
+            TextOutW(hdc, previewX, previewY + kPreviewPlaceholderHeight * scale, L"Preview — drag the level or XP bar to reposition it.", 52);
+        }
+        if (bufferBitmap)
+        {
+            BitBlt(
+                screenDc,
+                previewX,
+                previewY,
+                kPreviewPlaceholderWidth * kPreviewScale,
+                previewPaintHeight,
+                bufferDc,
+                previewX,
+                previewY,
+                SRCCOPY);
+            SelectObject(bufferDc, oldBufferBitmap);
+            DeleteObject(bufferBitmap);
+        }
+        if (bufferDc)
+        {
+            DeleteDC(bufferDc);
+        }
+        EndPaint(hwnd, &ps);
     }
 
     void CreateControls(HWND parent)
@@ -1125,8 +1374,22 @@ private:
         applyButton_ = CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 415, 64, 105, 28, parent, reinterpret_cast<HMENU>(IDC_APPLY), instance_, nullptr);
         testButton_ = CreateWindowW(L"BUTTON", L"TEST OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 260, 140, 32, parent, reinterpret_cast<HMENU>(IDC_TEST), instance_, nullptr);
         exitButton_ = CreateWindowW(L"BUTTON", L"EXIT OVERLAY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 380, 260, 140, 32, parent, reinterpret_cast<HMENU>(IDC_EXIT_OVERLAY), instance_, nullptr);
+        anchorHintLabel_ = CreateWindowW(L"STATIC", L"Anchor offsets from the slot origin (placeholder: 8,16):", WS_CHILD | WS_VISIBLE, 10, 305, 500, 22, parent, nullptr, instance_, nullptr);
+        levelAnchorLabel_ = CreateWindowW(L"STATIC", L"Level       X                         Y", WS_CHILD | WS_VISIBLE, 10, 335, 470, 22, parent, nullptr, instance_, nullptr);
+        levelAnchorXEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", IntToWide(levelAnchorX_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 105, 331, 150, 24, parent, reinterpret_cast<HMENU>(IDC_LEVEL_ANCHOR_X), instance_, nullptr);
+        levelAnchorYEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", IntToWide(levelAnchorY_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 300, 331, 150, 24, parent, reinterpret_cast<HMENU>(IDC_LEVEL_ANCHOR_Y), instance_, nullptr);
+        xpAnchorLabel_ = CreateWindowW(L"STATIC", L"XP bar      X                         Y", WS_CHILD | WS_VISIBLE, 10, 370, 470, 22, parent, nullptr, instance_, nullptr);
+        xpAnchorXEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", IntToWide(xpAnchorX_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 105, 366, 150, 24, parent, reinterpret_cast<HMENU>(IDC_XP_ANCHOR_X), instance_, nullptr);
+        xpAnchorYEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", IntToWide(xpAnchorY_).c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 300, 366, 150, 24, parent, reinterpret_cast<HMENU>(IDC_XP_ANCHOR_Y), instance_, nullptr);
+        resetAnchorsButton_ = CreateWindowW(L"BUTTON", L"Reset anchor offsets", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 410, 180, 30, parent, reinterpret_cast<HMENU>(IDC_RESET_ANCHORS), instance_, nullptr);
+        levelTextBackgroundCheck_ = CreateWindowW(L"BUTTON", L"Level text background", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 210, 413, 240, 24, parent, reinterpret_cast<HMENU>(IDC_LEVEL_TEXT_BACKGROUND), instance_, nullptr);
+        SendMessageW(levelTextBackgroundCheck_, BM_SETCHECK, levelTextBackgroundEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
+        for (HWND edit : { levelAnchorXEdit_, levelAnchorYEdit_, xpAnchorXEdit_, xpAnchorYEdit_ })
+        {
+            SetWindowSubclass(edit, AnchorEditSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        }
 
-        std::array<HWND, 27> controls = { offsetXLabel_, offsetXEdit_, offsetYLabel_, offsetYEdit_, gapYLabel_, gapYEdit_, expModeLabel_, expModeCombo_, numberStyleLabel_, numberStyleCombo_, levelColorsCheck_, skillPointsLabel_, skillPointsCombo_, slotModeLabel_, slotModeCombo_, nineSlotsPatchLink_, colorLowLabel_, colorLowEdit_, colorWhiteLabel_, colorWhiteEdit_, colorBrownLabel_, colorBrownEdit_, colorGoldLabel_, colorGoldEdit_, applyButton_, testButton_, exitButton_ };
+        std::array<HWND, 36> controls = { offsetXLabel_, offsetXEdit_, offsetYLabel_, offsetYEdit_, gapYLabel_, gapYEdit_, expModeLabel_, expModeCombo_, numberStyleLabel_, numberStyleCombo_, levelColorsCheck_, skillPointsLabel_, skillPointsCombo_, slotModeLabel_, slotModeCombo_, nineSlotsPatchLink_, colorLowLabel_, colorLowEdit_, colorWhiteLabel_, colorWhiteEdit_, colorBrownLabel_, colorBrownEdit_, colorGoldLabel_, colorGoldEdit_, applyButton_, testButton_, exitButton_, anchorHintLabel_, levelAnchorLabel_, levelAnchorXEdit_, levelAnchorYEdit_, xpAnchorLabel_, xpAnchorXEdit_, xpAnchorYEdit_, resetAnchorsButton_, levelTextBackgroundCheck_ };
         for (HWND control : controls)
         {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(guiFont), TRUE);
@@ -1184,7 +1447,7 @@ private:
         MoveWindow(offsetXEdit_, 80, rowY - 4, 55, 24, TRUE);
         MoveWindow(offsetYEdit_, 220, rowY - 4, 55, 24, TRUE);
         MoveWindow(gapYEdit_, 345, rowY - 4, 55, 24, TRUE);
-        MoveWindow(applyButton_, max(415, width - 125), rowY - 6, 105, 28, TRUE);
+        MoveWindow(applyButton_, 415, rowY - 6, 105, 28, TRUE);
 
         int modeY = rowY + 38;
         MoveWindow(expModeLabel_, 10, modeY, 70, 22, TRUE);
@@ -1214,7 +1477,7 @@ private:
 
         int buttonY = rowY + 190;
         MoveWindow(testButton_, 10, buttonY, 140, 32, TRUE);
-        MoveWindow(exitButton_, max(160, width - 150), buttonY, 140, 32, TRUE);
+        MoveWindow(exitButton_, 380, buttonY, 140, 32, TRUE);
     }
 
     void HandleCommand(int id, int notifyCode)
@@ -1276,6 +1539,29 @@ private:
             }
             break;
 
+        case IDC_RESET_ANCHORS:
+            ResetAnchorOffsets();
+            break;
+
+        case IDC_LEVEL_TEXT_BACKGROUND:
+            if (notifyCode == BN_CLICKED)
+            {
+                levelTextBackgroundEnabled_ = SendMessageW(levelTextBackgroundCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                SavePreferences();
+                RefreshOverlayAndPreview();
+            }
+            break;
+
+        case IDC_LEVEL_ANCHOR_X:
+        case IDC_LEVEL_ANCHOR_Y:
+        case IDC_XP_ANCHOR_X:
+        case IDC_XP_ANCHOR_Y:
+            if (notifyCode == EN_CHANGE)
+            {
+                ApplyAnchorControls();
+            }
+            break;
+
         case IDM_ABOUT:
             MessageBoxW(mainWnd_, L"Imperivm Hero Overlay C++ port", L"About", MB_OK | MB_ICONINFORMATION);
             break;
@@ -1311,11 +1597,31 @@ private:
         return parsed;
     }
 
+    void RefreshPreview()
+    {
+        constexpr int previewX = 610;
+        constexpr int previewY = 110;
+        RECT previewBounds = {
+            previewX,
+            previewY,
+            previewX + kPreviewPlaceholderWidth * kPreviewScale,
+            previewY + kPreviewPlaceholderHeight * kPreviewScale + 24
+        };
+        InvalidateRect(mainWnd_, &previewBounds, FALSE);
+    }
+
+    void RefreshOverlayAndPreview()
+    {
+        RefreshPreview();
+        InvalidateRect(overlayWnd_, nullptr, TRUE);
+    }
+
     void ApplyOffsetsFromControls()
     {
         offsetX_ = std::clamp(ReadIntEdit(offsetXEdit_, offsetX_), 0, 1000);
         offsetY_ = std::clamp(ReadIntEdit(offsetYEdit_, offsetY_), 0, 1000);
         gapY_ = std::clamp(ReadIntEdit(gapYEdit_, gapY_), 0, 200);
+        ApplyAnchorControls();
         levelColorLow_ = ReadColorEdit(colorLowEdit_, levelColorLow_, "<6");
         levelColorWhite_ = ReadColorEdit(colorWhiteEdit_, levelColorWhite_, "6+");
         levelColorBrown_ = ReadColorEdit(colorBrownEdit_, levelColorBrown_, "12+");
@@ -1325,7 +1631,7 @@ private:
         msg << "Settings updated - X: " << offsetX_ << ", Y: " << offsetY_ << ", Gap: " << gapY_;
         Log(msg.str());
         SavePreferences();
-        InvalidateRect(overlayWnd_, nullptr, TRUE);
+        RefreshOverlayAndPreview();
     }
 
     void ApplyExperienceModeFromControl()
@@ -1363,7 +1669,113 @@ private:
         }
         Log("Experience mode: " + modeName);
         SavePreferences();
-        InvalidateRect(overlayWnd_, nullptr, TRUE);
+        RefreshOverlayAndPreview();
+    }
+
+    void ApplyAnchorControls()
+    {
+        levelAnchorX_ = std::clamp(ReadIntEdit(levelAnchorXEdit_, levelAnchorX_), kAnchorMin, kAnchorMax);
+        levelAnchorY_ = std::clamp(ReadIntEdit(levelAnchorYEdit_, levelAnchorY_), kAnchorMin, kAnchorMax);
+        xpAnchorX_ = std::clamp(ReadIntEdit(xpAnchorXEdit_, xpAnchorX_), kAnchorMin, kAnchorMax);
+        xpAnchorY_ = std::clamp(ReadIntEdit(xpAnchorYEdit_, xpAnchorY_), kAnchorMin, kAnchorMax);
+        SavePreferences();
+        RefreshOverlayAndPreview();
+    }
+
+    void ResetAnchorOffsets()
+    {
+        // Exact stable-project defaults. OffsetX already denotes the XP bar.
+        SetWindowTextW(levelAnchorXEdit_, L"8");
+        SetWindowTextW(levelAnchorYEdit_, L"0");
+        SetWindowTextW(xpAnchorXEdit_, L"0");
+        SetWindowTextW(xpAnchorYEdit_, L"0");
+        ApplyAnchorControls();
+    }
+
+    void BeginAnchorDrag(int x, int y)
+    {
+        constexpr int originX = 626, originY = 142;
+        const int placeholderLeft = 610;
+        const int placeholderTop = 110;
+        const int placeholderRight = placeholderLeft + kPreviewPlaceholderWidth * kPreviewScale;
+        const int placeholderBottom = placeholderTop + kPreviewPlaceholderHeight * kPreviewScale;
+        if (x < placeholderLeft || x >= placeholderRight || y < placeholderTop || y >= placeholderBottom)
+        {
+            return;
+        }
+
+        const int barX = originX + (kPreviewStableOverlayX + xpAnchorX_) * kPreviewScale;
+        const int barY = originY + xpAnchorY_ * kPreviewScale;
+        if (expMode_ != ExperienceMode::Vertical)
+        {
+            constexpr int previewLevel = 13;
+            constexpr int previewSegments = 10;
+            const bool reducedMode = expMode_ == ExperienceMode::HorizontalReduced;
+            const int baseWidth = reducedMode ? kHorizontalReducedBlockBaseWidth : kHorizontalBlockBaseWidth;
+            const int widthLoss = reducedMode ? max(0, (previewLevel - 10) / 2) : max(0, (previewLevel - 10) / 4);
+            const int segmentWidth = std::clamp(baseWidth - widthLoss, kHorizontalBlockMinWidth, baseWidth) * kPreviewScale;
+            const int horizontalGap = kHorizontalGap * kPreviewScale;
+            const int usedWidth = previewSegments * segmentWidth + (previewSegments - 1) * horizontalGap;
+            const int horizontalBarLeft = barX + kHorizontalPaddingX * kPreviewScale;
+            const int horizontalBarTop = barY + kHorizontalYOffset * kPreviewScale;
+            const int horizontalBarRight = horizontalBarLeft + usedWidth;
+            const int horizontalBarBottom = horizontalBarTop + kHorizontalHeight * kPreviewScale;
+            if (x >= horizontalBarLeft && x < horizontalBarRight && y >= horizontalBarTop && y < horizontalBarBottom)
+            {
+                draggedAnchor_ = 1;
+                anchorDragGrabX_ = x - barX;
+                anchorDragGrabY_ = y - barY;
+                SetCapture(mainWnd_);
+                return;
+            }
+        }
+
+        constexpr int barHitPadding = 4;
+        if (expMode_ == ExperienceMode::Vertical &&
+            x >= barX - barHitPadding && x < barX + kIndicatorWidth * kPreviewScale + barHitPadding &&
+            y >= barY && y < barY + kIndicatorHeight * kPreviewScale)
+        {
+            draggedAnchor_ = 1;
+            anchorDragGrabX_ = x - barX;
+            anchorDragGrabY_ = y - barY;
+            SetCapture(mainWnd_);
+            return;
+        }
+
+        const bool horizontalMode = expMode_ != ExperienceMode::Vertical;
+        const int levelX = originX + (kPreviewStableOverlayX + levelAnchorX_ - (horizontalMode ? kHorizontalPaddingX : 0)) * kPreviewScale;
+        const int levelY = originY + (levelAnchorY_ + (horizontalMode ? kLevelTextYOffset : 0)) * kPreviewScale;
+        if (x >= levelX && x < levelX + 60 * kPreviewScale &&
+            y >= levelY && y < levelY + kLevelTextHeight * kPreviewScale)
+        {
+            draggedAnchor_ = 0;
+            anchorDragGrabX_ = x - levelX;
+            anchorDragGrabY_ = y - levelY;
+            SetCapture(mainWnd_);
+        }
+    }
+
+    void UpdateAnchorDrag(int x, int y)
+    {
+        constexpr int originX = 626, originY = 142;
+        const int draggedLeft = x - anchorDragGrabX_;
+        const int draggedTop = y - anchorDragGrabY_;
+        const bool horizontalLevel = draggedAnchor_ == 0 && expMode_ != ExperienceMode::Vertical;
+        const int horizontalLevelXCorrection = horizontalLevel ? kHorizontalPaddingX : 0;
+        const int horizontalLevelYCorrection = horizontalLevel ? kLevelTextYOffset : 0;
+        const int dx = std::clamp(
+            (draggedLeft - originX) / kPreviewScale - kPreviewStableOverlayX + horizontalLevelXCorrection,
+            kAnchorMin,
+            kAnchorMax);
+        const int dy = std::clamp(
+            (draggedTop - originY) / kPreviewScale - horizontalLevelYCorrection,
+            kAnchorMin,
+            kAnchorMax);
+        HWND xSlider = draggedAnchor_ == 0 ? levelAnchorXEdit_ : xpAnchorXEdit_;
+        HWND ySlider = draggedAnchor_ == 0 ? levelAnchorYEdit_ : xpAnchorYEdit_;
+        SetWindowTextW(xSlider, IntToWide(dx).c_str());
+        SetWindowTextW(ySlider, IntToWide(dy).c_str());
+        ApplyAnchorControls();
     }
 
     void ApplyNumberStyleFromControl()
@@ -1372,7 +1784,7 @@ private:
         numberStyle_ = selected == 1 ? NumberStyle::Roman : NumberStyle::Arabic;
         Log(std::string("Number style: ") + (numberStyle_ == NumberStyle::Roman ? "Roman" : "Arabic"));
         SavePreferences();
-        InvalidateRect(overlayWnd_, nullptr, TRUE);
+        RefreshOverlayAndPreview();
     }
 
     void ApplyLevelColorsFromControl()
@@ -1380,7 +1792,7 @@ private:
         levelColorsEnabled_ = SendMessageW(levelColorsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         Log(std::string("Level colors: ") + (levelColorsEnabled_ ? "enabled" : "disabled"));
         SavePreferences();
-        InvalidateRect(overlayWnd_, nullptr, TRUE);
+        RefreshOverlayAndPreview();
     }
 
     void ApplySkillPointsFromControl()
@@ -1389,7 +1801,7 @@ private:
         skillPointsStyle_ = selected == 1 ? SkillPointsStyle::ShowIndicator : SkillPointsStyle::ShowAll;
         Log(std::string("Skill points style: ") + (skillPointsStyle_ == SkillPointsStyle::ShowIndicator ? "Show indicator" : "Show all"));
         SavePreferences();
-        InvalidateRect(overlayWnd_, nullptr, TRUE);
+        RefreshOverlayAndPreview();
     }
 
     size_t DisplayedSlotCount() const
@@ -1680,22 +2092,32 @@ private:
 
             if (horizontalMode)
             {
-                PaintHorizontalBlocks(paintDc, blockEmptyBrush, fillBrush, outlineColor, offsetX_, yStart, displayLevel, displaySkillPoints, displayXpInLevel, displayXpNeeded, !flashing || flashBlinkOn, expMode_);
+                // Horizontal modes keep the stable default geometry, while allowing
+                // the level and experience bar to be positioned independently.
+                PaintLevelText(
+                    paintDc,
+                    displayLevel,
+                    displaySkillPoints,
+                    offsetX_ + levelAnchorX_ - kHorizontalPaddingX,
+                    yStart + levelAnchorY_ + kLevelTextYOffset,
+                    180,
+                    DT_LEFT);
+                PaintHorizontalBlocks(paintDc, blockEmptyBrush, fillBrush, outlineColor, offsetX_ + xpAnchorX_, yStart + xpAnchorY_, displayLevel, displayXpInLevel, displayXpNeeded, !flashing || flashBlinkOn, expMode_);
                 DeleteObject(fillBrush);
                 continue;
             }
 
-            PaintLevelText(paintDc, displayLevel, displaySkillPoints, offsetX_ + kIndicatorWidth + kVerticalLevelPaddingX, yStart, 90, DT_LEFT);
+            PaintLevelText(paintDc, displayLevel, displaySkillPoints, offsetX_ + levelAnchorX_, yStart + levelAnchorY_, 90, DT_LEFT);
 
-            RECT bg = { offsetX_, yStart, offsetX_ + kIndicatorWidth, yStart + kIndicatorHeight };
+            RECT bg = { offsetX_ + xpAnchorX_, yStart + xpAnchorY_, offsetX_ + xpAnchorX_ + kIndicatorWidth, yStart + xpAnchorY_ + kIndicatorHeight };
             FillRect(paintDc, &bg, barBgBrush);
 
             int barHeight = static_cast<int>((displayPct / 100.0) * kIndicatorHeight);
             RECT fg = {
-                offsetX_,
-                yStart + kIndicatorHeight - barHeight,
-                offsetX_ + kIndicatorWidth,
-                yStart + kIndicatorHeight
+                offsetX_ + xpAnchorX_,
+                yStart + xpAnchorY_ + kIndicatorHeight - barHeight,
+                offsetX_ + xpAnchorX_ + kIndicatorWidth,
+                yStart + xpAnchorY_ + kIndicatorHeight
             };
             if (!flashing || flashBlinkOn)
             {
@@ -1793,7 +2215,67 @@ private:
         return out;
     }
 
-    void PaintLevelText(HDC hdc, int level, int availableSkillPoints, int x, int y, int width, UINT align) const
+    void PaintLevelTextBackground(HDC hdc, const RECT& rect, bool previewSurface) const
+    {
+        if (previewSurface)
+        {
+            HDC sourceDc = CreateCompatibleDC(hdc);
+            HBITMAP sourceBitmap = CreateCompatibleBitmap(hdc, 1, 1);
+            HGDIOBJ oldBitmap = sourceBitmap ? SelectObject(sourceDc, sourceBitmap) : nullptr;
+            if (sourceDc && sourceBitmap)
+            {
+                SetPixelV(sourceDc, 0, 0, kLevelTextBackground);
+                BLENDFUNCTION blend = { AC_SRC_OVER, 0, 150, 0 };
+                AlphaBlend(hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, sourceDc, 0, 0, 1, 1, blend);
+            }
+            if (oldBitmap)
+            {
+                SelectObject(sourceDc, oldBitmap);
+            }
+            if (sourceBitmap)
+            {
+                DeleteObject(sourceBitmap);
+            }
+            if (sourceDc)
+            {
+                DeleteDC(sourceDc);
+            }
+            return;
+        }
+
+        // The game overlay uses a color key rather than per-pixel alpha. A fine
+        // checker pattern keeps half of the game pixels visible behind the label.
+        HDC patternDc = CreateCompatibleDC(hdc);
+        HBITMAP patternBitmap = CreateCompatibleBitmap(hdc, 2, 2);
+        HGDIOBJ oldBitmap = patternBitmap ? SelectObject(patternDc, patternBitmap) : nullptr;
+        if (patternDc && patternBitmap)
+        {
+            SetPixelV(patternDc, 0, 0, kLevelTextBackground);
+            SetPixelV(patternDc, 1, 0, kTransparentColor);
+            SetPixelV(patternDc, 0, 1, kTransparentColor);
+            SetPixelV(patternDc, 1, 1, kLevelTextBackground);
+            HBRUSH patternBrush = CreatePatternBrush(patternBitmap);
+            if (patternBrush)
+            {
+                FillRect(hdc, &rect, patternBrush);
+                DeleteObject(patternBrush);
+            }
+        }
+        if (oldBitmap)
+        {
+            SelectObject(patternDc, oldBitmap);
+        }
+        if (patternBitmap)
+        {
+            DeleteObject(patternBitmap);
+        }
+        if (patternDc)
+        {
+            DeleteDC(patternDc);
+        }
+    }
+
+    void PaintLevelText(HDC hdc, int level, int availableSkillPoints, int x, int y, int width, UINT align, int renderScale = 1, bool previewSurface = false) const
     {
         std::wstring levelText = FormatLevelText(level);
         if (availableSkillPoints > 0)
@@ -1807,9 +2289,10 @@ private:
                 levelText += std::wstring(static_cast<size_t>(availableSkillPoints), L'+');
             }
         }
-        RECT levelRect = { x, y, x + width, y + kLevelTextHeight };
+        renderScale = max(1, renderScale);
+        RECT levelRect = { x, y, x + width, y + kLevelTextHeight * renderScale };
         HFONT font = CreateFontW(
-            kLevelFontHeight,
+            kLevelFontHeight * renderScale,
             0,
             0,
             0,
@@ -1825,6 +2308,22 @@ private:
             L"Consolas");
 
         HGDIOBJ oldFont = font ? SelectObject(hdc, font) : nullptr;
+        if (levelTextBackgroundEnabled_)
+        {
+            SIZE textSize = {};
+            if (GetTextExtentPoint32W(hdc, levelText.c_str(), static_cast<int>(levelText.size()), &textSize))
+            {
+                const int paddingX = 3 * renderScale;
+                const int paddingY = 2 * renderScale;
+                RECT backgroundRect = {
+                    x - paddingX,
+                    y + paddingY,
+                    x + textSize.cx + paddingX,
+                    y + kLevelTextHeight * renderScale - paddingY
+                };
+                PaintLevelTextBackground(hdc, backgroundRect, previewSurface);
+            }
+        }
         int oldBkMode = SetBkMode(hdc, TRANSPARENT);
         COLORREF oldTextColor = SetTextColor(hdc, kLevelTextColor);
         DrawTextW(hdc, levelText.c_str(), -1, &levelRect, align | DT_SINGLELINE | DT_VCENTER | DT_NOCLIP);
@@ -1840,10 +2339,11 @@ private:
         }
     }
 
-    void PaintHorizontalBlocks(HDC hdc, HBRUSH emptyBrush, HBRUSH filledBrush, COLORREF outlineColor, int x, int yStart, int level, int availableSkillPoints, int xpInLevel, int xpNeeded, bool showFilledBlocks, ExperienceMode expMode)
+    void PaintHorizontalBlocks(HDC hdc, HBRUSH emptyBrush, HBRUSH filledBrush, COLORREF outlineColor, int x, int yStart, int level, int xpInLevel, int xpNeeded, bool showFilledBlocks, ExperienceMode expMode, int renderScale = 1)
     {
-        int blockX = x + kHorizontalPaddingX;
-        int y = yStart + kHorizontalYOffset;
+        renderScale = max(1, renderScale);
+        int blockX = x + kHorizontalPaddingX * renderScale;
+        int y = yStart + kHorizontalYOffset * renderScale;
         int segments = max(1, xpNeeded);
         int filledSegments = std::clamp(xpInLevel, 0, segments);
         int gaps = segments - 1;
@@ -1851,13 +2351,11 @@ private:
         bool barsMode = expMode == ExperienceMode::HorizontalBars;
         int baseWidth = (reducedMode) ? kHorizontalReducedBlockBaseWidth : kHorizontalBlockBaseWidth;
         int widthLoss = (reducedMode) ? max(0, (level - 10) / 2) : max(0, (level - 10) / 4);
-        int segmentWidth = std::clamp(baseWidth - widthLoss, kHorizontalBlockMinWidth, baseWidth);
-        int horizontalGap = level > 40 ? 2 : kHorizontalGap;
+        int segmentWidth = std::clamp(baseWidth - widthLoss, kHorizontalBlockMinWidth, baseWidth) * renderScale;
+        int horizontalGap = (level > 40 ? 2 : kHorizontalGap) * renderScale;
         int usedWidth = segments * segmentWidth + gaps * horizontalGap;
 
-        PaintLevelText(hdc, level, availableSkillPoints, blockX, yStart + kLevelTextYOffset, max(usedWidth, 90), DT_LEFT);
-
-        HPEN outlinePen = CreatePen(PS_SOLID, 1, outlineColor);
+        HPEN outlinePen = CreatePen(PS_SOLID, renderScale, outlineColor);
         HGDIOBJ oldPen = SelectObject(hdc, outlinePen);
         HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
@@ -1869,7 +2367,7 @@ private:
                 blockX,
                 y,
                 blockX + usedWidth,
-                y + kHorizontalHeight
+                y + kHorizontalHeight * renderScale
             };
             FillRect(hdc, &block, emptyBrush);
             int filledWidth = (filledSegments * usedWidth) / segments;
@@ -1879,7 +2377,7 @@ private:
                     blockX,
                     y,
                     blockX + filledWidth,
-                    y + kHorizontalHeight
+                    y + kHorizontalHeight * renderScale
                 };
                 FillRect(hdc, &filledBlock, filledBrush);
             }
@@ -1894,7 +2392,7 @@ private:
                     segmentX,
                     y,
                     segmentX + segmentWidth,
-                    y + kHorizontalHeight
+                    y + kHorizontalHeight * renderScale
                 };
                 FillRect(hdc, &block, showFilledBlocks && segment < filledSegments ? filledBrush : emptyBrush);
                 Rectangle(hdc, block.left, block.top, block.right, block.bottom);
@@ -1952,6 +2450,12 @@ private:
             DeleteObject(authorFont_);
             authorFont_ = nullptr;
         }
+        placeholderPreview_.reset();
+        if (gdiplusToken_)
+        {
+            Gdiplus::GdiplusShutdown(gdiplusToken_);
+            gdiplusToken_ = 0;
+        }
     }
 
     HINSTANCE instance_ = nullptr;
@@ -1966,6 +2470,15 @@ private:
     HWND slotModeLabel_ = nullptr;
     HWND slotModeCombo_ = nullptr;
     HWND nineSlotsPatchLink_ = nullptr;
+    HWND anchorHintLabel_ = nullptr;
+    HWND levelAnchorLabel_ = nullptr;
+    HWND levelAnchorXEdit_ = nullptr;
+    HWND levelAnchorYEdit_ = nullptr;
+    HWND xpAnchorLabel_ = nullptr;
+    HWND xpAnchorXEdit_ = nullptr;
+    HWND xpAnchorYEdit_ = nullptr;
+    HWND resetAnchorsButton_ = nullptr;
+    HWND levelTextBackgroundCheck_ = nullptr;
     HWND offsetXLabel_ = nullptr;
     HWND offsetXEdit_ = nullptr;
     HWND offsetYLabel_ = nullptr;
@@ -1989,6 +2502,8 @@ private:
     HWND testButton_ = nullptr;
     HWND exitButton_ = nullptr;
     HBRUSH controlBrush_ = CreateSolidBrush(kControlBg);
+    ULONG_PTR gdiplusToken_ = 0;
+    std::unique_ptr<Gdiplus::Image> placeholderPreview_;
     GameProcess process_;
     std::unique_ptr<GameMemoryReader> reader_;
     std::array<SlotInfo, kMaxSlotCount> slots_;
@@ -2001,6 +2516,17 @@ private:
     int offsetX_ = 60;
     int offsetY_ = 88;
     int gapY_ = 68;
+    int levelAnchorX_ = 8;
+    int levelAnchorY_ = 0;
+    int xpAnchorX_ = 0;
+    int xpAnchorY_ = 0;
+    int draggedAnchor_ = -1;
+    int anchorDragGrabX_ = 0;
+    int anchorDragGrabY_ = 0;
+    HWND scrubEdit_ = nullptr;
+    int scrubStartX_ = 0;
+    int scrubStartValue_ = 0;
+    bool scrubMoved_ = false;
     int lastX_ = -1;
     int lastY_ = -1;
     int lastWidth_ = -1;
@@ -2012,6 +2538,7 @@ private:
     SkillPointsStyle skillPointsStyle_ = SkillPointsStyle::ShowAll;
     SlotDisplayMode slotDisplayMode_ = SlotDisplayMode::StandardFive;
     bool levelColorsEnabled_ = false;
+    bool levelTextBackgroundEnabled_ = false;
     COLORREF levelColorLow_ = RGB(146, 163, 204);
     COLORREF levelColorWhite_ = RGB(248, 250, 255);
     COLORREF levelColorBrown_ = RGB(185, 105, 35);
