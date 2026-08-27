@@ -732,36 +732,19 @@ public:
         {
             uint32_t slotAddr = player + 0x0AC + static_cast<uint32_t>(hotkey * 0x2C);
             std::vector<uint16_t> uids = ReadListUnits(slotAddr + 0x14);
-            HeroInfo singleHero;
-            int heroCount = 0;
             for (uint16_t uid : uids)
             {
                 HeroInfo hero;
                 if (ReadHeroFromUid(uid, hero))
                 {
-                    ++heroCount;
-                    if (heroCount == 1)
-                    {
-                        singleHero = std::move(hero);
-                    }
-                    else
-                    {
-                        // A multi-hero control group has no unambiguous level or
-                        // experience value, so it must remain hidden.
-                        break;
-                    }
+                    slots[static_cast<size_t>(hotkey - 1)].pct = hero.pct;
+                    slots[static_cast<size_t>(hotkey - 1)].level = hero.level;
+                    slots[static_cast<size_t>(hotkey - 1)].xpInLevel = hero.xpInLevel;
+                    slots[static_cast<size_t>(hotkey - 1)].xpNeeded = hero.xpNeeded;
+                    slots[static_cast<size_t>(hotkey - 1)].availableSkillPoints = hero.availableSkillPoints;
+                    slots[static_cast<size_t>(hotkey - 1)].label = hero.name.empty() ? "Hero" : hero.name;
+                    break;
                 }
-            }
-
-            if (heroCount == 1)
-            {
-                SlotInfo& slot = slots[static_cast<size_t>(hotkey - 1)];
-                slot.pct = singleHero.pct;
-                slot.level = singleHero.level;
-                slot.xpInLevel = singleHero.xpInLevel;
-                slot.xpNeeded = singleHero.xpNeeded;
-                slot.availableSkillPoints = singleHero.availableSkillPoints;
-                slot.label = singleHero.name.empty() ? "Hero" : singleHero.name;
             }
         }
 
