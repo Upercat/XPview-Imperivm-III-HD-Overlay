@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwctype>
 #include <commctrl.h>
 #include <windowsx.h>
@@ -937,30 +938,39 @@ private:
             return "";
         }
 
-        int32_t capacity = ReadInt(addr + 20);
-        int32_t size = ReadInt(addr + 16);
-        if (capacity < 0 || size < 0 || size > 1000)
+        struct RemoteString
+        {
+            std::array<char, 16> storage = {};
+            int32_t size = 0;
+            int32_t capacity = 0;
+        };
+        static_assert(sizeof(RemoteString) == 24);
+
+        RemoteString remote;
+        if (!ReadBytes(addr, &remote, sizeof(remote)))
+        {
+            return "";
+        }
+        if (remote.capacity < 0 || remote.size < 0 || remote.size > 1000 || remote.size > remote.capacity)
+        {
+            return "";
+        }
+        if (remote.size == 0)
         {
             return "";
         }
 
-        std::vector<char> bytes(static_cast<size_t>(size));
-        if (capacity < 16)
+        if (remote.capacity < 16)
         {
-            std::array<char, 16> inlineBytes = {};
-            if (ReadBytes(addr, inlineBytes.data(), inlineBytes.size()))
-            {
-                std::copy(inlineBytes.begin(), inlineBytes.begin() + size, bytes.begin());
-                return std::string(bytes.begin(), bytes.end());
-            }
+            return std::string(remote.storage.data(), static_cast<size_t>(remote.size));
         }
-        else
+
+        uint32_t ptr = 0;
+        std::memcpy(&ptr, remote.storage.data(), sizeof(ptr));
+        std::vector<char> bytes(static_cast<size_t>(remote.size));
+        if (ReadBytes(ptr, bytes.data(), bytes.size()))
         {
-            uint32_t ptr = ReadPtr(addr);
-            if (ptr != 0 && ReadBytes(ptr, bytes.data(), bytes.size()))
-            {
-                return std::string(bytes.begin(), bytes.end());
-            }
+            return std::string(bytes.begin(), bytes.end());
         }
 
         return "";
@@ -976,34 +986,12 @@ private:
                 break;
             }
 
-            int32_t capacity = ReadInt(current + 28);
-            int32_t size = ReadInt(current + 24);
-            if (size > 0 && size < 100)
+            std::string name = LowerCopy(GetStdString(current + 8));
+            if (!name.empty() && name.size() < 100)
             {
-                std::vector<char> bytes(static_cast<size_t>(size));
-                bool ok = false;
-                if (capacity < 16)
+                if (name.find("hero") != std::string::npos)
                 {
-                    std::array<char, 16> inlineBytes = {};
-                    ok = ReadBytes(current + 8, inlineBytes.data(), inlineBytes.size());
-                    if (ok)
-                    {
-                        std::copy(inlineBytes.begin(), inlineBytes.begin() + size, bytes.begin());
-                    }
-                }
-                else
-                {
-                    uint32_t ptr = ReadPtr(current + 8);
-                    ok = ReadBytes(ptr, bytes.data(), bytes.size());
-                }
-
-                if (ok)
-                {
-                    std::string name = LowerCopy(std::string(bytes.begin(), bytes.end()));
-                    if (name.find("hero") != std::string::npos)
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
 
