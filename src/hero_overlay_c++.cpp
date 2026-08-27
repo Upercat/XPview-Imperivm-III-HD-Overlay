@@ -13,6 +13,8 @@
 #include <commctrl.h>
 #include <windowsx.h>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <memory>
@@ -123,6 +125,221 @@ enum class SlotDisplayMode
     StandardFive,
     PatchedNine,
 };
+
+#if defined(_DEBUG) || defined(HERO_OVERLAY_PERF_DIAGNOSTICS)
+constexpr bool kPerformanceInstrumentation = true;
+#else
+constexpr bool kPerformanceInstrumentation = false;
+#endif
+
+enum class PerformanceState
+{
+    Disconnected,
+    Active,
+    MapHidden,
+    Minimized,
+};
+
+const char* PerformanceStateName(PerformanceState state)
+{
+    switch (state)
+    {
+    case PerformanceState::Active:
+        return "active";
+    case PerformanceState::MapHidden:
+        return "map-hidden";
+    case PerformanceState::Minimized:
+        return "minimized";
+    default:
+        return "disconnected";
+    }
+}
+
+struct TimingAccumulator
+{
+    uint64_t count = 0;
+    uint64_t totalMicroseconds = 0;
+    uint64_t maximumMicroseconds = 0;
+
+    void Add(uint64_t microseconds)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            ++count;
+            totalMicroseconds += microseconds;
+            maximumMicroseconds = (std::max)(maximumMicroseconds, microseconds);
+        }
+    }
+
+    void Reset()
+    {
+        count = 0;
+        totalMicroseconds = 0;
+        maximumMicroseconds = 0;
+    }
+};
+
+class ScopedPerformanceTimer
+{
+public:
+    explicit ScopedPerformanceTimer(TimingAccumulator& accumulator) : accumulator_(accumulator)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            started_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~ScopedPerformanceTimer()
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started_);
+            accumulator_.Add(static_cast<uint64_t>(elapsed.count()));
+        }
+    }
+
+private:
+    TimingAccumulator& accumulator_;
+    std::chrono::steady_clock::time_point started_ = {};
+};
+
+class PerformanceMetrics
+{
+public:
+    void Initialize(const std::wstring& preferencesPath)
+    {
+        if constexpr (!kPerformanceInstrumentation)
+        {
+            return;
+        }
+
+        logPath_ = std::filesystem::path(preferencesPath).parent_path() / L"hero_overlay_performance.log";
+        std::ofstream log(logPath_, std::ios::trunc);
+        log << "XPview performance diagnostics\n"
+            << "Build: " << (kPerformanceInstrumentation ? "instrumented" : "normal") << "\n"
+            << "Columns: state, CPU, Tick, ScanHeroSlots, ReadProcessMemory, PaintOverlay\n";
+
+        reportStarted_ = std::chrono::steady_clock::now();
+        lastCpuTime100ns_ = ReadProcessCpuTime100ns();
+        SYSTEM_INFO systemInfo = {};
+        GetSystemInfo(&systemInfo);
+        processorCount_ = (std::max)(1u, static_cast<unsigned int>(systemInfo.dwNumberOfProcessors));
+    }
+
+    void SetState(PerformanceState state)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            state_ = state;
+        }
+    }
+
+    void RecordMemoryRead(size_t bytes, bool succeeded)
+    {
+        if constexpr (kPerformanceInstrumentation)
+        {
+            ++readCalls_;
+            readBytes_ += static_cast<uint64_t>(bytes);
+            if (!succeeded)
+            {
+                ++readFailures_;
+            }
+        }
+    }
+
+    void MaybeReport()
+    {
+        if constexpr (!kPerformanceInstrumentation)
+        {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - reportStarted_).count();
+        if (seconds < 5.0)
+        {
+            return;
+        }
+
+        const uint64_t cpuTime100ns = ReadProcessCpuTime100ns();
+        const uint64_t cpuDelta100ns = cpuTime100ns >= lastCpuTime100ns_ ? cpuTime100ns - lastCpuTime100ns_ : 0;
+        const double cpuPercent = seconds > 0.0
+            ? (static_cast<double>(cpuDelta100ns) / (seconds * 10000000.0 * processorCount_)) * 100.0
+            : 0.0;
+
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2)
+            << "[PERF] state=" << PerformanceStateName(state_)
+            << " window_s=" << seconds
+            << " cpu=" << cpuPercent << "%"
+            << " tick={count:" << tick_.count << ",avg_us:" << Average(tick_) << ",max_us:" << tick_.maximumMicroseconds << "}"
+            << " scan={count:" << scan_.count << ",avg_us:" << Average(scan_) << ",max_us:" << scan_.maximumMicroseconds << "}"
+            << " rpm={calls:" << readCalls_ << ",calls_s:" << (readCalls_ / seconds)
+            << ",bytes:" << readBytes_ << ",bytes_s:" << (readBytes_ / seconds) << ",failures:" << readFailures_ << "}"
+            << " paint={count:" << paint_.count << ",fps:" << (paint_.count / seconds)
+            << ",avg_us:" << Average(paint_) << ",max_us:" << paint_.maximumMicroseconds << "}";
+
+        const std::string text = line.str();
+        OutputDebugStringA((text + "\n").c_str());
+        std::ofstream log(logPath_, std::ios::app);
+        log << text << '\n';
+
+        tick_.Reset();
+        scan_.Reset();
+        paint_.Reset();
+        readCalls_ = 0;
+        readBytes_ = 0;
+        readFailures_ = 0;
+        reportStarted_ = now;
+        lastCpuTime100ns_ = cpuTime100ns;
+    }
+
+    TimingAccumulator tick_;
+    TimingAccumulator scan_;
+    TimingAccumulator paint_;
+
+private:
+    static uint64_t FileTimeToUint64(const FILETIME& fileTime)
+    {
+        ULARGE_INTEGER value = {};
+        value.LowPart = fileTime.dwLowDateTime;
+        value.HighPart = fileTime.dwHighDateTime;
+        return value.QuadPart;
+    }
+
+    static uint64_t ReadProcessCpuTime100ns()
+    {
+        FILETIME creation = {};
+        FILETIME exit = {};
+        FILETIME kernel = {};
+        FILETIME user = {};
+        if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+        {
+            return 0;
+        }
+        return FileTimeToUint64(kernel) + FileTimeToUint64(user);
+    }
+
+    static double Average(const TimingAccumulator& timing)
+    {
+        return timing.count > 0
+            ? static_cast<double>(timing.totalMicroseconds) / static_cast<double>(timing.count)
+            : 0.0;
+    }
+
+    std::filesystem::path logPath_;
+    std::chrono::steady_clock::time_point reportStarted_ = {};
+    uint64_t lastCpuTime100ns_ = 0;
+    unsigned int processorCount_ = 1;
+    PerformanceState state_ = PerformanceState::Disconnected;
+    uint64_t readCalls_ = 0;
+    uint64_t readBytes_ = 0;
+    uint64_t readFailures_ = 0;
+};
+
+PerformanceMetrics gPerformanceMetrics;
 
 std::wstring IntToWide(int value)
 {
@@ -444,7 +661,9 @@ public:
             size,
             &bytesRead);
 
-        return ok && bytesRead == size;
+        const bool succeeded = ok && bytesRead == size;
+        gPerformanceMetrics.RecordMemoryRead(size, succeeded);
+        return succeeded;
     }
 
     int32_t ReadInt(uint32_t address) const
@@ -792,6 +1011,7 @@ public:
     {
         instanceForLog_ = this;
         BuildPreferencesPath();
+        gPerformanceMetrics.Initialize(preferencesPath_);
         LoadPreferences();
         INITCOMMONCONTROLSEX controls = { sizeof(controls), ICC_BAR_CLASSES };
         InitCommonControlsEx(&controls);
@@ -1073,6 +1293,7 @@ private:
             if (wParam == kTimerId)
             {
                 Tick();
+                gPerformanceMetrics.MaybeReport();
             }
             return 0;
 
@@ -1879,6 +2100,12 @@ private:
 
     void Tick()
     {
+        ScopedPerformanceTimer tickTimer(gPerformanceMetrics.tick_);
+        gPerformanceMetrics.SetState(
+            process_.process && IsWindow(process_.hwnd)
+                ? PerformanceState::Active
+                : PerformanceState::Disconnected);
+
         if (!process_.process || !IsWindow(process_.hwnd))
         {
             DisconnectProcess();
@@ -1910,6 +2137,7 @@ private:
         RECT rect = {};
         if (!GetWindowRect(process_.hwnd, &rect))
         {
+            gPerformanceMetrics.SetState(PerformanceState::Disconnected);
             DisconnectProcess();
             return;
         }
@@ -1918,6 +2146,7 @@ private:
         int y = rect.top;
         if (x < -32000 || y < -32000)
         {
+            gPerformanceMetrics.SetState(PerformanceState::Minimized);
             ShowWindow(overlayWnd_, SW_HIDE);
             return;
         }
@@ -1946,6 +2175,7 @@ private:
         TacticalMapState tacticalMap = reader_ ? reader_->ReadTacticalMapState() : TacticalMapState{};
         bool globalMapActive = mapPtr != 0;
         bool mapOverlayBlocked = globalMapActive || tacticalMap.open;
+        gPerformanceMetrics.SetState(mapOverlayBlocked ? PerformanceState::MapHidden : PerformanceState::Active);
         if (mapOverlayBlocked && overlayVisible_)
         {
             overlayVisible_ = false;
@@ -1957,7 +2187,15 @@ private:
             ShowWindow(overlayWnd_, SW_SHOWNOACTIVATE);
         }
 
-        slots_ = mapOverlayBlocked || !reader_ ? std::array<SlotInfo, kMaxSlotCount>() : reader_->ScanHeroSlots(DisplayedSlotCount());
+        if (mapOverlayBlocked || !reader_)
+        {
+            slots_ = {};
+        }
+        else
+        {
+            ScopedPerformanceTimer scanTimer(gPerformanceMetrics.scan_);
+            slots_ = reader_->ScanHeroSlots(DisplayedSlotCount());
+        }
         UpdateLevelFlashState(slots_);
 
         InvalidateRect(overlayWnd_, nullptr, FALSE);
@@ -2000,6 +2238,7 @@ private:
 
     void PaintOverlay(HWND hwnd)
     {
+        ScopedPerformanceTimer paintTimer(gPerformanceMetrics.paint_);
         PAINTSTRUCT ps = {};
         HDC hdc = BeginPaint(hwnd, &ps);
         if (!hdc)
